@@ -1,0 +1,70 @@
+# role: admin access to Pods/Logs within the ecommerce-dev namespace only
+
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: order-admin-role
+  namespace: ecommerce-dev
+rules:
+- apiGroups: [""] # indicates the core API group
+  resources: ["secrets", "configmaps", "pods", "services", "endpoints", "persistentvolumeclaims", "pods/log"]
+  verbs: ["get", "watch", "list", "create", "update", "bind", "delete", "patch"]
+
+- apiGroups: ["apps"]
+  resources: ["deployments"]
+  verbs: ["get", "watch", "list", "create", "update", "bind", "delete", "patch"]
+
+---
+
+# RoleBinding: binds the Role to a specific Azure AD group (by objectId)
+
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: order-admin-role-binding
+  namespace: ecommerce-dev
+subjects:
+  - kind: Group
+    name: "d22bbcd6-7ede-4d6b-81a1-31b9a97d47fc"
+    apiGroup: rbac.authorization.k8s.io
+roleRef:
+  kind: Role
+  name: order-admin-role
+  apiGroup: rbac.authorization.k8s.io
+
+
+---
+
+# role: admin access to Pods/Logs within the ecommerce-dev namespace only
+
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: order-admin-role
+  namespace: ecommerce-dev
+rules:
+- apiGroups: [""] # indicates the core API group
+  resources: ["secrets", "configmaps", "pods", "services", "endpoints", "persistentvolumeclaims", "pods/log"]
+  verbs: ["get", "watch", "list", "create", "update", "bind", "delete", "patch"]
+
+- apiGroups: ["apps"]
+  resources: ["deployments"]
+  verbs: ["get", "watch", "list", "create", "update", "bind", "delete", "patch"]
+
+---
+
+# RoleBinding: binds the Role to a specific Azure AD group (by objectId)
+
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: order-admin-role-binding
+  namespace: ecommerce-dev
+subjects:
+  - kind: Group
+    name: "d22bbcd6-7ede-4d6b-81a1-31b9a97d47fc"
+    apiGroup: rbac.authorization.k8s.io
+roleRef:
+  kind: ClusterRole
+  name: order-admin-role
+  apiGroup: rbac.authorization.k8s.io

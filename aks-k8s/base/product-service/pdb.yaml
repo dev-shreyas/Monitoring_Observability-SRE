@@ -1,0 +1,19 @@
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  creationTimestamp: "2026-09-20T15:22:42Z"
+  generation: 1
+  name: product-service-pdb
+  namespace: ecommerce-dev
+  resourceVersion: "422516"
+  uid: b12cb9c7-cd13-4be1-8179-df9ae3ffef1e
+spec:
+  minAvailable: 2
+  selector:
+    matchLabels:
+      app: product-service
+status:
+  currentHealthy: 0
+  desiredHealthy: 0
+  disruptionsAllowed: 0
+  expectedPods: 0

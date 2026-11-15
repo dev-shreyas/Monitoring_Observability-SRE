@@ -1,0 +1,28 @@
+# Routes everything to the frontend, which serves the app shell and reverse-proxies the
+# /products, /login, /cart ... paths on to the backend Services itself (see
+# frontend/nginx.conf). That is why there are no per-service rules here: nginx inside the
+# frontend pod already does that routing, and duplicating it would mean two places to keep
+# in sync.
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: ecommerce-ingress
+  namespace: ecommerce-dev
+  annotations:
+    nginx.ingress.kubernetes.io/ssl-redirect: "false" # no TLS cert wired up yet
+spec:
+  # ingressClassName replaces the deprecated kubernetes.io/ingress.class annotation the
+  # guide uses; the annotation is ignored on current ingress-nginx.
+  ingressClassName: nginx
+  rules:
+    # No host: matches any Host header, so the load balancer IP works directly in a
+    # browser. Add "host: api.shop.example.com" once there is a real DNS name and cert.
+    - http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: frontend
+                port:
+                  number: 80
