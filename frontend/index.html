@@ -1,0 +1,388 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Aether Commerce</title>
+    <meta
+      name="description"
+      content="Aether Commerce — premium electronics, apparel, home essentials, and everyday essentials."
+    />
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800;900&display=swap"
+      rel="stylesheet"
+    />
+    <link rel="stylesheet" href="./styles.css" />
+  </head>
+  <body>
+    <div class="app-shell">
+      <header class="topbar">
+        <div class="brand-block">
+          <button id="navToggle" class="nav-toggle" aria-label="Menu">☰</button>
+          <div class="brand" data-page-target="home">
+            <span class="brand-mark">A</span>
+            <div>
+              <strong>Aether</strong>
+              <small>commerce</small>
+            </div>
+          </div>
+        </div>
+
+        <nav class="main-nav" aria-label="Main navigation">
+          <button class="nav-link active" data-page-target="home">Home</button>
+          <button class="nav-link" data-page-target="catalog">Shop</button>
+          <button class="nav-link" data-page-target="orders">Orders</button>
+          <button class="nav-link nav-link-badged" data-page-target="releases">
+            What's New
+            <span class="nav-dot" aria-hidden="true"></span>
+          </button>
+          <button class="nav-link" data-page-target="profile">Profile</button>
+        </nav>
+
+        <div class="header-actions">
+          <div class="search-box">
+            <span>⌕</span>
+            <input id="searchInput" type="search" placeholder="Search products" aria-label="Search products" />
+          </div>
+          <button id="themeToggle" class="icon-btn theme-toggle" aria-label="Toggle dark mode">🌙</button>
+          <button id="authButton" class="secondary-btn">Login</button>
+          <button id="wishlistButton" class="cart-btn wishlist-btn" aria-label="Open wishlist">
+            <span>♡ Wishlist</span>
+            <span id="wishlistCount" class="count-pill">0</span>
+          </button>
+          <button id="cartButton" class="cart-btn" aria-label="Open cart">
+            <span>Cart</span>
+            <span id="cartCount" class="count-pill">0</span>
+          </button>
+        </div>
+      </header>
+
+      <main class="main-content">
+        <section id="homePage" class="page active">
+          <section class="hero">
+            <div class="hero-copy">
+              <span class="eyebrow">Smart essentials</span>
+              <h1>Everything you want, delivered beautifully.</h1>
+              <p>
+                Discover premium tech, everyday apparel, and curated products chosen to make life feel effortless.
+              </p>
+              <div class="hero-actions">
+                <button class="primary-btn" data-page-target="catalog">Shop now</button>
+                <button class="ghost-btn" data-page-target="orders">Track orders</button>
+              </div>
+              <ul class="trust-list">
+                <li>Free shipping over ₹2,999</li>
+                <li>Secure checkout</li>
+                <li>24/7 support</li>
+              </ul>
+            </div>
+
+            <div class="hero-visual">
+              <div class="float-card card-top">
+                <span>New</span>
+                <strong>Ultra-slim laptop</strong>
+                <small>From ₹89,999</small>
+              </div>
+              <div class="device-showcase">
+                <div class="device-glow"></div>
+                <div class="device-screen"></div>
+              </div>
+              <div class="float-card card-bottom">
+                <strong>4.8/5</strong>
+                <small>2.3k happy customers</small>
+              </div>
+            </div>
+          </section>
+
+          <section class="promo-grid">
+            <article class="promo-card primary reveal">
+              <span>Weekend drop</span>
+              <h3>Up to 40% off on premium gear</h3>
+              <button class="text-btn" data-page-target="catalog">Explore deals</button>
+            </article>
+            <article class="promo-card dark reveal">
+              <span>Fresh arrivals</span>
+              <h3>Minimal home essentials, elevated.</h3>
+              <button class="text-btn" data-page-target="catalog">Shop home</button>
+            </article>
+          </section>
+
+          <section class="section-header">
+            <div>
+              <span class="eyebrow">Popular categories</span>
+              <h2>Made for everyday living</h2>
+            </div>
+            <button class="link-btn" data-page-target="catalog">View all</button>
+          </section>
+
+          <section class="category-grid">
+            <button class="category-card reveal" data-category="electronics">
+              <span>⚡</span>
+              <strong>Electronics</strong>
+            </button>
+            <button class="category-card reveal" data-category="apparel">
+              <span>👕</span>
+              <strong>Apparel</strong>
+            </button>
+            <button class="category-card reveal" data-category="home">
+              <span>🏠</span>
+              <strong>Home</strong>
+            </button>
+            <button class="category-card reveal" data-category="books">
+              <span>📚</span>
+              <strong>Books</strong>
+            </button>
+          </section>
+
+          <section class="featured-section">
+            <div class="section-header compact">
+              <div>
+                <span class="eyebrow dark">Trending now</span>
+                <h2>Fresh picks for your routine</h2>
+              </div>
+            </div>
+            <div id="featuredGrid" class="featured-grid"></div>
+          </section>
+        </section>
+
+        <section id="catalogPage" class="page">
+          <div class="catalog-header">
+            <div>
+              <span class="eyebrow">Browse catalog</span>
+              <h2>Best picks for this season</h2>
+            </div>
+            <div class="filter-row">
+              <div id="categoryTabs" class="segmented-control" aria-label="Category filters"></div>
+            </div>
+          </div>
+
+          <div class="catalog-toolbar">
+            <div class="catalog-pill-group">
+              <span class="catalog-count" id="catalogCount">0 items</span>
+            </div>
+            <label class="sort-wrap">
+              <span>Sort</span>
+              <select id="sortSelect">
+                <option value="featured">Featured</option>
+                <option value="price-asc">Price: Low to high</option>
+                <option value="price-desc">Price: High to low</option>
+              </select>
+            </label>
+          </div>
+          <div id="catalogGrid" class="catalog-grid" aria-live="polite"></div>
+        </section>
+
+        <section id="ordersPage" class="page">
+          <div class="page-panel">
+            <div class="panel-title-row">
+              <div>
+                <span class="eyebrow">Your account</span>
+                <h2>Orders & purchases</h2>
+              </div>
+            </div>
+            <div id="ordersList" class="orders-list"></div>
+          </div>
+        </section>
+
+        <section id="releasesPage" class="page">
+          <div class="page-panel releases-panel">
+            <div class="panel-title-row">
+              <div>
+                <span class="eyebrow">Product updates</span>
+                <h2>Release notes</h2>
+                <p class="releases-subtitle">See what's new, improved, and fixed at Aether Commerce.</p>
+              </div>
+            </div>
+            <div id="releasesTimeline" class="releases-timeline"></div>
+          </div>
+        </section>
+
+        <section id="profilePage" class="page">
+          <div class="page-panel profile-panel">
+            <div class="profile-head">
+              <div class="avatar">A</div>
+              <div>
+                <span class="eyebrow">Account</span>
+                <h2 id="profileName">Guest user</h2>
+              </div>
+            </div>
+            <div class="profile-meta">
+              <div>
+                <small>Email</small>
+                <strong id="profileEmail">Not signed in</strong>
+              </div>
+              <div>
+                <small>Member since</small>
+                <strong>Today</strong>
+              </div>
+            </div>
+            <div class="profile-actions">
+              <button id="logoutButton" class="secondary-btn hidden">Logout</button>
+            </div>
+          </div>
+        </section>
+      </main>
+
+      <footer class="site-footer">
+        <div class="footer-grid">
+          <div class="footer-col footer-brand-col">
+            <div class="brand">
+              <span class="brand-mark">A</span>
+              <div>
+                <strong>Aether</strong>
+                <small>commerce</small>
+              </div>
+            </div>
+            <p>Premium electronics, apparel, and home essentials — delivered beautifully.</p>
+            <div class="social-buttons">
+              <a class="social-btn social-instagram" href="#" aria-label="Follow us on Instagram" title="Instagram">IG</a>
+              <a class="social-btn social-facebook" href="#" aria-label="Follow us on Facebook" title="Facebook">f</a>
+              <a class="social-btn social-google" href="#" aria-label="Find us on Google" title="Google">G</a>
+            </div>
+          </div>
+
+          <div class="footer-col">
+            <h4>Need help?</h4>
+            <a class="footer-contact-link" href="tel:+919876543210">📞 +91 98765 43210</a>
+            <a class="footer-contact-link" href="mailto:support@aethercommerce.example">✉️ support@aethercommerce.example</a>
+            <span class="footer-note">Support available 24/7</span>
+          </div>
+
+          <div class="footer-col">
+            <h4>Visit us</h4>
+            <p class="footer-address">48, MG Road, Bengaluru, Karnataka 560001, India</p>
+            <a
+              class="ghost-btn footer-map-btn"
+              href="https://www.google.com/maps/search/?api=1&query=48%2C%20MG%20Road%2C%20Bengaluru%2C%20Karnataka%20560001"
+              target="_blank"
+              rel="noopener noreferrer"
+            >
+              📍 Get directions
+            </a>
+          </div>
+        </div>
+
+        <div class="footer-bottom">
+          <span>© 2026 Aether Commerce. All rights reserved.</span>
+          <span class="footer-dot">·</span>
+          <span class="footer-trademark">Aether Commerce™ is a trademark of Aether Commerce Pvt. Ltd.</span>
+        </div>
+      </footer>
+    </div>
+
+    <aside id="mobileMenu" class="mobile-menu" aria-label="Mobile navigation">
+      <div class="drawer-header">
+        <div>
+          <span class="eyebrow">Navigate</span>
+          <h3>Menu</h3>
+        </div>
+        <button id="closeMobileMenuButton" class="icon-btn" aria-label="Close menu">✕</button>
+      </div>
+      <div class="mobile-nav-list">
+        <button class="mobile-nav-link" data-page-target="home">Home</button>
+        <button class="mobile-nav-link" data-page-target="catalog">Shop</button>
+        <button class="mobile-nav-link" data-page-target="orders">Orders</button>
+        <button id="mobileWishlistLink" class="mobile-nav-link">♡ Wishlist</button>
+        <button class="mobile-nav-link" data-page-target="releases">What's New</button>
+        <button class="mobile-nav-link" data-page-target="profile">Profile</button>
+      </div>
+    </aside>
+
+    <aside id="cartDrawer" class="cart-drawer" aria-label="Shopping cart">
+      <div class="drawer-header">
+        <div>
+          <span class="eyebrow">Your bag</span>
+          <h3>Shopping cart</h3>
+        </div>
+        <button id="closeCartButton" class="icon-btn" aria-label="Close cart">✕</button>
+      </div>
+
+      <div id="cartItems" class="cart-items"></div>
+
+      <div class="cart-summary">
+        <div class="coupon-row">
+          <input id="couponInput" type="text" placeholder="Coupon code (optional)" />
+        </div>
+        <div id="couponChips" class="coupon-chips"></div>
+        <div class="summary-line">
+          <span>Subtotal</span>
+          <strong id="subtotalValue">₹0</strong>
+        </div>
+        <div class="summary-line">
+          <span>Shipping</span>
+          <strong>Free</strong>
+        </div>
+        <div class="summary-line total">
+          <span>Total</span>
+          <strong id="totalValue">₹0</strong>
+        </div>
+        <button id="checkoutButton" class="primary-btn wide">Checkout</button>
+      </div>
+    </aside>
+
+    <aside id="wishlistDrawer" class="cart-drawer" aria-label="Wishlist">
+      <div class="drawer-header">
+        <div>
+          <span class="eyebrow">Saved for later</span>
+          <h3>Wishlist</h3>
+        </div>
+        <button id="closeWishlistButton" class="icon-btn" aria-label="Close wishlist">✕</button>
+      </div>
+
+      <div id="wishlistItems" class="cart-items"></div>
+    </aside>
+
+    <div id="cartBackdrop" class="backdrop"></div>
+
+    <div id="authModal" class="modal hidden" role="dialog" aria-modal="true" aria-labelledby="authTitle">
+      <div class="modal-card">
+        <button class="icon-btn close-modal" data-close-modal="authModal" aria-label="Close auth dialog">✕</button>
+        <div class="modal-header">
+          <span class="eyebrow">Welcome</span>
+          <h3 id="authTitle">Login to continue</h3>
+        </div>
+
+        <div class="tabs small-tabs">
+          <button class="tab-btn active" data-auth-mode="login">Login</button>
+          <button class="tab-btn" data-auth-mode="register">Register</button>
+        </div>
+
+        <form id="authForm" class="auth-form">
+          <div id="displayNameWrap" class="field hidden">
+            <label for="displayNameInput">Full name</label>
+            <input id="displayNameInput" type="text" placeholder="Jane Doe" />
+          </div>
+          <div class="field">
+            <label for="emailInput">Email</label>
+            <input id="emailInput" type="email" placeholder="you@example.com" required />
+          </div>
+          <div class="field">
+            <label for="passwordInput">Password</label>
+            <input id="passwordInput" type="password" placeholder="Minimum 8 chars" required />
+          </div>
+          <button type="submit" class="primary-btn wide">Continue</button>
+        </form>
+      </div>
+    </div>
+
+    <div id="productModal" class="modal hidden" role="dialog" aria-modal="true" aria-labelledby="productModalTitle">
+      <div class="modal-card product-modal-card">
+        <button class="icon-btn close-modal" data-close-modal="productModal" aria-label="Close product modal">✕</button>
+        <div class="product-detail-layout" id="productDetailLayout"></div>
+      </div>
+    </div>
+
+    <div id="toast" class="toast" aria-live="polite"></div>
+
+    <nav class="mobile-footer" aria-label="Quick actions">
+      <button class="mobile-action" data-page-target="home">Home</button>
+      <button class="mobile-action" data-page-target="catalog">Shop</button>
+      <button class="mobile-action" data-page-target="orders">Orders</button>
+      <button class="mobile-action" data-page-target="profile">Profile</button>
+    </nav>
+
+    <script src="./app.js"></script>
+  </body>
+</html>
