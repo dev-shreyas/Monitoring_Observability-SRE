@@ -1,0 +1,53 @@
+# Single Ingress for the whole app.
+#
+# Everything goes to the frontend, whose own nginx proxies /login, /products, /cart and
+# friends on to the three backend Services (see frontend-nginx-configmap.yaml). That is
+# why there are no per-service rules here.
+#
+# The previous version routed /users, /products and /orders straight to the services with
+# a rewrite-target stripping the prefix. That does not match how the app actually calls
+# them: the browser requests bare paths like /login and /products, not /users/login. Two
+# Ingresses matching overlapping paths in one namespace is also ambiguous, so
+# frontend-ingress.yaml has been folded into this file.
+#
+# No TLS block: cert-manager and Let's Encrypt need a publicly resolvable DNS name, which
+# a laptop cluster does not have. Plain HTTP is correct here.
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: ecommerce-ingress
+  namespace: ecommerce-dev
+  annotations:
+    nginx.ingress.kubernetes.io/ssl-redirect: "false"
+    # RATE LIMITING (P0.5) -- the first line of defence, before any app code runs.
+    # Per client IP: 20 requests/second sustained, bursts up to 5x that (100) queued
+    # without delay. A real page load is ~10 requests, so shoppers never notice; a
+    # script hammering /login or /search gets refused at the edge.
+    # Refusals are 429 because the controller ConfigMap sets limit-req-status-code
+    # (the default is 503, which looks like an outage on every dashboard) -- see the
+    # README, step 4.
+    nginx.ingress.kubernetes.io/limit-rps: "20"
+    nginx.ingress.kubernetes.io/limit-burst-multiplier: "5"
+    nginx.ingress.kubernetes.io/limit-connections: "40"
+    # In-cluster callers are exempt: the k6 load generator is ONE pod IP sending far
+    # more than 20 rps on purpose. 10.244.0.0/16 is kind's pod CIDR; outside callers
+    # cannot claim it (the controller uses the TCP peer address, not a header).
+    nginx.ingress.kubernetes.io/limit-allowlist: "10.244.0.0/16"
+spec:
+  # ingressClassName, not the old kubernetes.io/ingress.class annotation, which current
+  # ingress-nginx ignores. Note the original had these as `labels:` rather than
+  # `annotations:` as well, which made them inert either way.
+  ingressClassName: nginx
+  rules:
+    # No host, so any Host header matches and http://localhost/ works directly. Add
+    # "host: aether.local" plus a /etc/hosts entry if you want to practise name-based
+    # routing.
+    - http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: frontend
+                port:
+                  name: http

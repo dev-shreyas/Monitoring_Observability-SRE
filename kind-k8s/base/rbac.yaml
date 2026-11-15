@@ -1,0 +1,103 @@
+# RBAC, reworked for a local cluster.
+#
+# The Azure version bound to an Entra ID group by object id
+# ("d22bbcd6-7ede-4d6b-81a1-31b9a97d47fc"). kind has no Entra ID -- it authenticates with
+# a client certificate -- so that subject matches nobody and the binding is inert.
+#
+# Here the subject is a ServiceAccount instead, which has a real advantage for learning:
+# you can actually impersonate it and prove the rules work, which you cannot easily do
+# with an Entra group.
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: developer
+  namespace: ecommerce-dev
+---
+# Namespace-scoped. Deliberately read-mostly: get/list/watch plus logs and exec, which is
+# what someone debugging the app needs. No create/delete -- deployments come from
+# manifests, not from humans running kubectl against a namespace.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: app-developer
+  namespace: ecommerce-dev
+rules:
+  - apiGroups: [""]
+    resources: ["pods", "pods/log", "services", "endpoints", "configmaps", "persistentvolumeclaims"]
+    verbs: ["get", "watch", "list"]
+
+  # Separated from the rule above on purpose. "secrets" read access means reading every
+  # credential in the namespace, so it belongs on its own line where a reviewer sees it.
+  # Delete this rule if the developer role should not see secrets -- which is the usual
+  # answer once real credentials are involved.
+  - apiGroups: [""]
+    resources: ["secrets"]
+    verbs: ["get", "list"]
+
+  - apiGroups: ["apps"]
+    resources: ["deployments", "replicasets", "statefulsets"]
+    verbs: ["get", "watch", "list"]
+
+  # Restart a Deployment without being able to redefine it.
+  - apiGroups: ["apps"]
+    resources: ["deployments/scale"]
+    verbs: ["get", "update", "patch"]
+
+  # Interactive debugging. pods/exec is genuinely powerful -- a shell in a pod can read
+  # every mounted secret and reach anything the pod's network policy allows.
+  - apiGroups: [""]
+    resources: ["pods/exec", "pods/portforward"]
+    verbs: ["create"]
+
+# Note the dropped "bind" verb from the original. "bind" only applies to roles and
+# clusterroles (it is the escalation guard on RoleBinding creation); on pods and
+# deployments it is silently meaningless.
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: app-developer
+  namespace: ecommerce-dev
+subjects:
+  - kind: ServiceAccount
+    name: developer
+    namespace: ecommerce-dev
+roleRef:
+  kind: Role
+  name: app-developer
+  apiGroup: rbac.authorization.k8s.io
+---
+# Cluster-scoped, and intentionally tiny.
+#
+# The Azure version defined a ClusterRole with the SAME rules as the namespaced Role --
+# including read on all secrets -- which silently granted them across every namespace and
+# contradicted its own "within the ecommerce-dev namespace only" comment. That is the
+# classic RBAC mistake: a ClusterRole is never scoped by the namespace field in its
+# metadata (which is ignored entirely), only by how it is bound.
+#
+# What legitimately needs cluster scope is reading objects that have no namespace.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: cluster-inspector
+rules:
+  - apiGroups: [""]
+    resources: ["nodes", "namespaces"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["storage.k8s.io"]
+    resources: ["storageclasses"]
+    verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: cluster-inspector
+subjects:
+  - kind: ServiceAccount
+    name: developer
+    namespace: ecommerce-dev
+roleRef:
+  kind: ClusterRole
+  name: cluster-inspector
+  apiGroup: rbac.authorization.k8s.io

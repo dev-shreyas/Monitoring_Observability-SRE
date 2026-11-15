@@ -1,0 +1,191 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  labels:
+    app: order-service
+  name: order-service
+  namespace: ecommerce-dev
+spec:
+  replicas: 2
+  revisionHistoryLimit: 5           ## keep last 5 ReplicaSets for easy rollback
+  selector:
+    matchLabels:
+      app: order-service
+      #azure.workload.identity/use: "true"
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1                 # 1 additional pod can be scheduled above the desired number of pods during rolling update
+      maxUnavailable: 0           # 0 downtime pods can be unavailable during rolling update
+  template:
+    metadata:
+      labels:
+        app: order-service
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "3003"
+        #secrets-store.csi.k8s.io/used: "true"
+        #secrets-store.csi.k8s.io/managed: "true"  
+    spec:
+      serviceAccountName: order-service-sa
+      # The following tolerations allow the pods to be scheduled on nodes with the specified taints.
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels:
+              app: order-service
+              #azure.workload.identity/use: "true"
+      # Pod-level hardening (P0.7). RuntimeDefault applies the container runtime's
+      # seccomp profile, which blocks ~60 syscalls (kernel module loading, kexec,
+      # namespace tricks) that a Node or nginx process never needs. Together with the
+      # container settings below this satisfies Pod Security "restricted", which the
+      # ecommerce-dev namespace now ENFORCES.
+      securityContext:
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+      - image: order-service:local
+        # IfNotPresent so the kubelet uses the image loaded into the kind
+        # node by `kind load docker-image` instead of trying to pull it from a
+        # registry that does not exist locally.
+        imagePullPolicy: IfNotPresent
+        name: order-service
+        ports:
+        - containerPort: 3003
+        # Plain configuration, not secrets. Without these order-service falls back to its
+        # offline stub catalog instead of calling the real services -- visible in its logs
+        # as "PRODUCT_SERVICE_URL is not set". Port 80 is the ClusterIP Service port,
+        # which forwards to the container's own port.
+        env:
+        - name: USER_SERVICE_URL
+          value: "http://user-service.ecommerce-dev.svc.cluster.local:80"
+        - name: PRODUCT_SERVICE_URL
+          value: "http://product-service.ecommerce-dev.svc.cluster.local:80"
+        # --- Tracing -------------------------------------------------------------------
+        # The SDK is INERT unless OTEL_EXPORTER_OTLP_ENDPOINT is set (see src/tracing.ts),
+        # which is what keeps `npm test` free of a collector. Setting it here turns tracing
+        # on for the deployed pods only.
+        #
+        # Port 4318 is OTLP over HTTP/protobuf. Alloy also listens on 4317 for gRPC; HTTP
+        # is used because it needs no native gRPC dependency and a failed export is a plain
+        # HTTP status you can reproduce with curl.
+        # The pod's NODE ip (not its own ip), straight from the kubelet via the downward
+        # API. No hard-coding, no DNS: each pod learns where it is scheduled at start.
+        - name: NODE_IP
+          valueFrom:
+            fieldRef:
+              fieldPath: status.hostIP
+        # NODE-LOCAL delivery: send spans to the Alloy agent on THIS node, which exposes
+        # 4318 as a hostPort. Two reasons this beats the cluster-wide `alloy` Service:
+        #   1. telemetry never crosses a node boundary, so a node losing its peers (or
+        #      a network partition) cannot stop the app from emitting;
+        #   2. an export stall is isolated to one node's agent instead of a random one,
+        #      so a single bad agent cannot back-pressure application threads cluster-wide.
+        # The Service address still works and is the fallback if hostPort is unavailable:
+        #   http://alloy.monitoring.svc.cluster.local:4318
+        - name: OTEL_EXPORTER_OTLP_ENDPOINT
+          value: "http://$(NODE_IP):4318"
+        # The single most important attribute in tracing: what Grafana groups spans by and
+        # what Tempo builds its service graph from. Unset, every span reads
+        # "unknown_service".
+        - name: OTEL_SERVICE_NAME
+          value: "order-service"
+        # Pod identity straight from the Kubernetes API, via the downward API.
+        - name: K8S_POD_NAME
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.name
+        - name: K8S_NAMESPACE_NAME
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.namespace
+        # Declaring these as resource attributes activates the FIRST pod_association rule
+        # in Alloy's k8sattributes processor. That rule is authoritative, so it sidesteps
+        # two failure modes of the IP-based fallback: spans sent in a pod's first seconds
+        # (before Alloy's pod cache has its IP) arriving with no k8s.* attributes at all,
+        # and any future proxy that rewrites the source IP.
+        - name: OTEL_RESOURCE_ATTRIBUTES
+          value: "k8s.pod.name=$(K8S_POD_NAME),k8s.namespace.name=$(K8S_NAMESPACE_NAME)"
+        # Points both services at the shared store. Its PRESENCE is what selects the
+        # Redis repositories over the in-memory ones (see each repository's factory).
+        # Unset it and the pods silently fall back to per-pod memory, which is the
+        # bug this fixes -- the services log a warning at startup when that happens.
+        - name: REDIS_URL
+          value: "redis://redis.ecommerce-dev.svc.cluster.local:6379"
+        envFrom:
+        - secretRef:
+            name: order-service-secrets             # The name of the Kubernetes Secret object that contains the environment variables for the order-service container. This secret is created by the SecretProviderClass and contains the secrets fetched from Azure Key Vault.
+        resources:
+          # CPU request = what the scheduler reserves AND what the HPA's 65% target is a
+          # percentage of. 100m was far below real use (a busy pod uses 150-400m), so the
+          # scheduler packed in more pods than the CPUs could run, and the HPA scaled out at
+          # just 65m. 250m matches a busy pod, so both now plan with real numbers.
+          requests:
+            cpu: 250m
+            memory: 250Mi
+          limits:
+            cpu: 500m
+            memory: 500Mi
+        # STARTUP PROBE: liveness and readiness do not begin until this has succeeded once.
+        # Without it, a pod that starts slowly -- loading the OpenTelemetry auto-instrumentation
+        # on a CPU-contended node took 1m44s on 2026-11-11 -- is killed by the liveness probe
+        # (~75s budget) before it ever finishes starting, and restarts forever. This allows up
+        # to 3 minutes for a start, while liveness keeps its quick reaction for a pod that
+        # hangs AFTER it started.
+        startupProbe:
+          httpGet:
+            path: /health
+            port: 3003
+          periodSeconds: 5
+          timeoutSeconds: 3
+          failureThreshold: 36
+        livenessProbe:                               # The liveness probe checks if the order-service container is still running and healthy. If the liveness probe fails, Kubernetes will restart the container.
+          httpGet:
+            path: /health
+            port: 3003
+          initialDelaySeconds: 15
+          periodSeconds: 20
+          timeoutSeconds: 5
+          failureThreshold: 3
+        readinessProbe:                               # The readiness probe checks if the order-service container is ready to serve traffic. If the readiness probe fails, the container will not receive traffic from the Service.
+          httpGet:
+            path: /health
+            port: 3003
+          initialDelaySeconds: 10
+          periodSeconds: 10
+          timeoutSeconds: 5
+          failureThreshold: 3
+        # volumeMounts:
+        #   - name: secrets-store
+        #     mountPath: "/mnt/secrets-store"
+        #     readOnly: true
+        securityContext:
+          runAsNonRoot: true
+          # Required alongside runAsNonRoot because the Dockerfile ends with
+          # "USER appuser" -- a name, not a number. The kubelet cannot resolve a username
+          # to a UID without starting the container, so it refuses to start it at all:
+          #   Error: container has runAsNonRoot and image has non-numeric user (appuser),
+          #   cannot verify user is non-root
+          # These are the actual ids baked into the image by
+          # "adduser -S appuser -G appgroup" on Alpine (verified with id -u / id -g).
+          # The cleaner long-term fix is "USER 100:101" in the Dockerfile, which makes the
+          # image self-describing and removes the need for these two lines.
+          runAsUser: 100
+          runAsGroup: 101
+          readOnlyRootFilesystem: true
+          allowPrivilegeEscalation: false
+          # Drop every Linux capability: the process listens on an unprivileged port
+          # (>1024) and needs none. Without this the container keeps the runtime's
+          # default set (NET_RAW, CHOWN, SETUID...), which an attacker who got code
+          # execution could use, e.g. NET_RAW to craft packets for ARP spoofing.
+          capabilities:
+            drop: ["ALL"]
+      # volumes:
+      #   - name: secrets-store
+      #     csi:
+      #       driver: secrets-store.csi.k8s.io
+      #       readOnly: true
+      #       volumeAttributes:
+      #         secretProviderClass: "ecommerce-dev-azure-kv-secrets"

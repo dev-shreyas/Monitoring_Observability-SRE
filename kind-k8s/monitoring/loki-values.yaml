@@ -1,0 +1,177 @@
+# Loki for a local kind cluster.
+#
+# Chart: grafana/loki 7.5.0 (Loki 3.6.x). Keys below were checked against that version's
+# defaults (`helm show values grafana/loki --version 7.5.0`). Another chart version may
+# rename or move them, and Helm silently ignores keys it does not recognise.
+#
+# Install:
+#   helm upgrade --install loki grafana/loki -n monitoring --version 7.5.0 -f loki-values.yaml
+#
+# Result: ONE pod (loki-0) with a 5Gi PVC. Push and query URL inside the cluster:
+#   http://loki.monitoring.svc.cluster.local:3100
+#
+# The chart's defaults are built for production on cloud object storage: 3 read + 3 write +
+# 3 backend pods, an S3 bucket, an nginx gateway, two memcached caches (the chunks cache alone
+# requests 8 GB) and a canary on every node. Most of this file switches that off.
+
+# ---------------------------------------------------------------------------------------------
+# Deployment mode
+# ---------------------------------------------------------------------------------------------
+# Loki is ONE binary containing several internal components. The mode decides how many pods
+# they are split across:
+#   SingleBinary   -> all components in one process/pod. Small volumes, laptops.
+#   SimpleScalable -> 3 pod types: write (distributor+ingester), read (querier+frontend),
+#                     backend (compactor, ruler, index gateway). The chart default. Needs object storage.
+#   Distributed    -> every component its own Deployment/StatefulSet. Large production.
+#
+# Inside the single pod, a log line's life is:
+#   distributor  receives the push from Alloy, validates it, picks the ingester(s)
+#   ingester     buffers lines per stream in memory (+ a write-ahead log on disk), then
+#                flushes them as compressed CHUNKS to storage
+#   index (TSDB) records which chunks hold which label set and time range
+#   querier      on a query, finds chunks through the index and reads them
+#   query-frontend  splits a long query into small time ranges and runs them in parallel
+#   compactor    merges index files and deletes data past retention
+#   ruler        evaluates LogQL alert rules (unused here)
+deploymentMode: SingleBinary
+
+loki:
+  # Multi-tenancy. When true, every push and every query must carry an X-Scope-OrgID header
+  # naming a tenant, otherwise Loki answers "no org id". One tenant locally, so turn it off.
+  # Loki then stores everything under the built-in tenant "fake".
+  auth_enabled: false
+
+  commonConfig:
+    # How many ingesters receive a copy of each line. Default 3, which needs 3 ingesters;
+    # with one pod, writes would wait for copies that can never exist.
+    replication_factor: 1
+    # path_prefix (/var/loki) is left at the default: it is where the PVC is mounted, and the
+    # WAL, chunks, index and compactor directories all live under it.
+
+  # Where chunks and index files are written. "filesystem" = the pod's own disk (the PVC),
+  # into the directories /var/loki/chunks and /var/loki/rules. Only valid with one Loki
+  # replica, because other pods cannot see this disk. Production uses s3, gcs or azure.
+  storage:
+    type: filesystem
+
+  # The schema says HOW data is laid out on storage, from a given date onward. It is a list
+  # because a real cluster adds a new entry when upgrading the schema, and old data keeps
+  # being read with the entry that was active when it was written. The chart refuses to
+  # render without it.
+  schemaConfig:
+    configs:
+      # The date this entry starts applying. It must be in the past; never edit it after data
+      # exists, add a new entry instead.
+      - from: "2026-01-01"
+        # Index type. tsdb is the current one (boltdb-shipper is the older, deprecated one).
+        store: tsdb
+        # Where index and chunk files go; matches loki.storage.type.
+        object_store: filesystem
+        # Schema version. v13 is current and is required for structured metadata.
+        schema: v13
+        index:
+          prefix: index_
+          # One index file per day. tsdb requires 24h.
+          period: 24h
+
+  # Per-tenant limits. Helm MERGES this map with the chart's defaults (query timeouts and so
+  # on), so only the keys we add here change.
+  limits_config:
+    # Delete logs older than 3 days, matching Prometheus retention. This line alone does
+    # NOTHING: the compactor below must have retention_enabled, or data is kept forever.
+    retention_period: 72h
+
+  compactor:
+    working_directory: /var/loki/compactor
+    # The switch that actually enforces limits_config.retention_period.
+    retention_enabled: true
+    # How often the compactor runs.
+    compaction_interval: 10m
+    # Grace period between marking chunks for deletion and deleting them.
+    retention_delete_delay: 2h
+    # Where pending delete requests are stored. Required once retention is enabled.
+    delete_request_store: filesystem
+
+  # Detects recurring log line patterns, shown in Grafana's Logs Drilldown app under "Patterns".
+  # Small cost, and useful on JSON request logs like these services write.
+  pattern_ingester:
+    enabled: true
+
+  # Stop Loki sending anonymous usage statistics to Grafana Labs.
+  analytics:
+    reporting_enabled: false
+
+# ---------------------------------------------------------------------------------------------
+# The single Loki pod
+# ---------------------------------------------------------------------------------------------
+singleBinary:
+  # Chart default is 0, because the default mode is SimpleScalable. Must be set explicitly.
+  replicas: 1
+  persistence:
+    enabled: true
+    # Chart default is 10Gi. 3 days of logs from this app is a few hundred MB at most.
+    size: 5Gi
+    # kind's built-in local-path provisioner. The volume is a directory on one kind node,
+    # so loki-0 always schedules back onto that node.
+    storageClass: standard
+  resources:
+    requests:
+      cpu: 100m
+      memory: 256Mi
+    limits:
+      # The ingester holds recent lines in memory before flushing; 1Gi is plenty here.
+      memory: 1Gi
+
+# ---------------------------------------------------------------------------------------------
+# Switch off the SimpleScalable pods. These keys apply to that mode; zeroing them makes
+# sure nothing is created for it even if the mode is changed by mistake.
+# ---------------------------------------------------------------------------------------------
+write:
+  replicas: 0
+read:
+  replicas: 0
+backend:
+  replicas: 0
+
+# ---------------------------------------------------------------------------------------------
+# Optional extras the chart enables by default
+# ---------------------------------------------------------------------------------------------
+
+# nginx in front of Loki that routes /push and /query to the right component. Needed when
+# Loki is split into several pods; with one pod it is just an extra hop. Without it, Alloy
+# and Grafana talk to the "loki" Service on port 3100 directly.
+gateway:
+  enabled: false
+
+# memcached caches for chunks and query results. They speed up repeated queries over large
+# volumes. The chunks cache alone requests 8 GB of memory, so on kind they stay Pending.
+chunksCache:
+  enabled: false
+resultsCache:
+  enabled: false
+
+# A DaemonSet that writes synthetic log lines and checks it can read them back, and a Helm
+# test pod that uses it. Production health checks; not needed to learn Loki.
+lokiCanary:
+  enabled: false
+test:
+  enabled: false
+
+# A sidecar container that loads LogQL alert rules from ConfigMaps labelled loki_rule.
+# Re-enable when you write log-based alerts.
+sidecar:
+  rules:
+    enabled: false
+
+# ---------------------------------------------------------------------------------------------
+# Loki's own metrics into your Prometheus
+# ---------------------------------------------------------------------------------------------
+monitoring:
+  serviceMonitor:
+    # Creates a ServiceMonitor for Loki's /metrics. Your Prometheus selects every
+    # ServiceMonitor (serviceMonitorSelectorNilUsesHelmValues: false), so it is picked up
+    # without a release label. Try: rate(loki_distributor_lines_received_total[5m])
+    enabled: true
+    # A Grafana Agent Operator object; you run Alloy, not Grafana Agent.
+    metricsInstance:
+      enabled: false

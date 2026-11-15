@@ -1,0 +1,14 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: ecommerce-dev
+  labels:
+    # ENFORCE the restricted Pod Security Standard (P0.7). Every workload satisfies it:
+    # non-root, no privilege escalation, read-only root filesystem, all capabilities
+    # dropped, RuntimeDefault seccomp. Until the last two were added this said
+    # "enforce: baseline" and every rollout printed PodSecurity warnings. Enforcing
+    # turns a regression into an admission error at deploy time, not a finding later.
+    pod-security.kubernetes.io/enforce: restricted
+    pod-security.kubernetes.io/enforce-version: latest
+    pod-security.kubernetes.io/warn: restricted
+    pod-security.kubernetes.io/audit: restricted

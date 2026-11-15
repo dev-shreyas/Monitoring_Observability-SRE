@@ -1,0 +1,14 @@
+# kubectl apply -k kind-k8s/load-testing
+#
+# The script is turned into a ConfigMap with a content hash in its name, so editing
+# script.js and re-applying rolls the Deployment automatically -- no manual restart.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+namespace: load-testing
+resources:
+  - namespace.yaml
+  - deployment.yaml
+configMapGenerator:
+  - name: k6-script
+    files:
+      - script.js

@@ -1,0 +1,127 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  labels:
+    app: frontend
+  name: frontend
+  namespace: ecommerce-dev
+spec:
+  replicas: 2
+  revisionHistoryLimit: 5
+  selector:
+    matchLabels:
+      app: frontend
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+  template:
+    metadata:
+      labels:
+        app: frontend
+      # No azure.workload.identity/use label and no ServiceAccount: the frontend reads
+      # nothing from Key Vault. It serves static files and reverse-proxies to the three
+      # backend Services, so it needs no Azure identity at all.
+      annotations:
+        prometheus.io/scrape: "false"
+    spec:
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels:
+              app: frontend
+      # Pod-level hardening (P0.7). RuntimeDefault applies the container runtime's
+      # seccomp profile, which blocks ~60 syscalls (kernel module loading, kexec,
+      # namespace tricks) that a Node or nginx process never needs. Together with the
+      # container settings below this satisfies Pod Security "restricted", which the
+      # ecommerce-dev namespace now ENFORCES.
+      securityContext:
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+      - image: aether-frontend:local
+        # IfNotPresent so the kubelet uses the image loaded into the kind
+        # node by `kind load docker-image` instead of trying to pull it from a
+        # registry that does not exist locally.
+        imagePullPolicy: IfNotPresent
+        name: frontend
+        # 8080, not 80: the Dockerfile's nginx.conf listens on an unprivileged port
+        # specifically so the master process can run as a non-root user. Binding 80 would
+        # require root or NET_BIND_SERVICE.
+        ports:
+        - containerPort: 8080
+        resources:
+          requests:
+            cpu: 50m
+            memory: 64Mi
+          limits:
+            cpu: 200m
+            memory: 128Mi
+        # No /health endpoint in this image -- the app shell at / is the health signal.
+        # STARTUP PROBE: liveness and readiness do not begin until this has succeeded once.
+        # Without it, a pod that starts slowly -- loading the OpenTelemetry auto-instrumentation
+        # on a CPU-contended node took 1m44s on 2026-11-11 -- is killed by the liveness probe
+        # (~75s budget) before it ever finishes starting, and restarts forever. This allows up
+        # to 3 minutes for a start, while liveness keeps its quick reaction for a pod that
+        # hangs AFTER it started.
+        startupProbe:
+          httpGet:
+            path: /
+            port: 8080
+          periodSeconds: 5
+          timeoutSeconds: 3
+          failureThreshold: 36
+        livenessProbe:
+          httpGet:
+            path: /
+            port: 8080
+          initialDelaySeconds: 10
+          periodSeconds: 20
+          timeoutSeconds: 5
+          failureThreshold: 3
+        readinessProbe:
+          httpGet:
+            path: /
+            port: 8080
+          initialDelaySeconds: 5
+          periodSeconds: 10
+          timeoutSeconds: 5
+          failureThreshold: 3
+        volumeMounts:
+          # readOnlyRootFilesystem below blocks every write, and nginx must write its pid
+          # plus five temp paths. nginx.conf already redirects all of them under /tmp
+          # (pid /tmp/nginx.pid, proxy_temp_path /tmp/proxy_temp, and so on), so mounting
+          # writable scratch here is what makes the read-only root filesystem workable.
+          - name: tmp
+            mountPath: /tmp
+          # subPath replaces just this one file instead of masking all of /etc/nginx,
+          # which would hide proxy-common.conf and mime.types that come from the image.
+          - name: nginx-config
+            mountPath: /etc/nginx/nginx.conf
+            subPath: nginx.conf
+            readOnly: true
+        securityContext:
+          runAsNonRoot: true
+          # GID 102, NOT 101 like the three backend services. The frontend image is
+          # nginx:1.27-alpine rather than node:24-alpine, and "adduser -S" allocated a
+          # different group id there (verified: appuser:x:100:102 in /etc/passwd).
+          # Copying 101 from the backends would fail to start the container.
+          runAsUser: 100
+          runAsGroup: 102
+          readOnlyRootFilesystem: true
+          allowPrivilegeEscalation: false
+          # Drop every Linux capability: the process listens on an unprivileged port
+          # (>1024) and needs none. Without this the container keeps the runtime's
+          # default set (NET_RAW, CHOWN, SETUID...), which an attacker who got code
+          # execution could use, e.g. NET_RAW to craft packets for ARP spoofing.
+          capabilities:
+            drop: ["ALL"]
+      volumes:
+        - name: tmp
+          emptyDir: {}
+        - name: nginx-config
+          configMap:
+            name: frontend-nginx-config

@@ -1,0 +1,255 @@
+# STATUS (2026-11-12): VERIFIED, BUT NOT KEPT ENABLED ON THE KIND CLUSTER.
+# Kept OUT of kind-k8s/base/ so it is only ever applied deliberately:
+#   kubectl apply -f kind-k8s/security/network-policies.yaml
+#
+# Verified with the cluster calm (k6 paused): every flow below worked -- shop end to end,
+# Prometheus scrapes (0 targets down), traces from all three services in Tempo -- and
+# every other path was blocked: another namespace -> Redis / user-service / frontend,
+# frontend -> Redis, user-service -> frontend.
+#
+# Why it is not left on: kindnet enforces policy through a containerd NRI plugin, and
+# when the Docker VM is CPU-saturated (the 24h k6 run plus HPA scale-out) that plugin
+# drops out ("nri plugin exited ... ttrpc: closed") and kindnet stops learning about new
+# pods. It then fails CLOSED for pods created during a scale-out: on 2026-11-11 new
+# user-service pods became unreachable from the frontend and login returned 502. A
+# security control that takes the shop down under load is worse than none.
+#
+# To run it for real, give it an enforcer that does not depend on NRI timing:
+#   - Calico on kind (disableDefaultCNI: true in kind-config.yaml + the Calico manifest), or
+#   - AKS with --network-policy azure|calico|cilium (the production target), or
+#   - more CPU for the Docker VM / a lower k6 rate, then restart kindnet and confirm every
+#     kindnet log shows "Caches are synced" and no "nri plugin exited".
+#
+# NetworkPolicies for ecommerce-dev (P0.7) -- default deny, then one rule per real flow.
+#
+# Before this file every pod could reach every other pod in the cluster: anything that
+# got code execution anywhere (a compromised k6 image, a bad Helm chart in another
+# namespace) could talk straight to Redis -- no password -- and read every cart, account
+# and password hash, or call the services directly and skip the ingress rate limits.
+#
+# HOW TO READ THESE: policies are ALLOW-lists and they add up. A pod selected by any
+# policy for a direction (Ingress/Egress) accepts only what some policy allows. The first
+# policy selects every pod for both directions with no rules = deny everything; the rest
+# open exactly the flows the app uses:
+#
+#   ingress-nginx --> frontend:8080 --> user-service:3001 ----> product-service:3002
+#                                   --> product-service:3002       ^
+#                                   --> order-service:3003 --------+
+#                                   user/order/product-service --> redis:6379
+#   prometheus (monitoring) --> each service's /metrics
+#   every pod --> CoreDNS:53          services --> Alloy agent :4318 (OTLP traces)
+#
+# Enforced on kind by kindnet (its built-in network policy controller). On AKS this needs
+# a policy engine: --network-policy azure|calico|cilium at cluster creation.
+#
+# Ports are the CONTAINER ports (8080, 3001...), not the Service ports (80): kube-proxy
+# rewrites the Service address to a pod address before the policy is evaluated.
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny-all
+  namespace: ecommerce-dev
+spec:
+  podSelector: {}
+  policyTypes: [Ingress, Egress]
+---
+# DNS for everyone. Without it every Service name lookup fails and nothing works.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-dns-egress
+  namespace: ecommerce-dev
+spec:
+  podSelector: {}
+  policyTypes: [Egress]
+  egress:
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+          podSelector:
+            matchLabels:
+              k8s-app: kube-dns
+      ports:
+        - { protocol: UDP, port: 53 }
+        - { protocol: TCP, port: 53 }
+---
+# Traces: the three services send OTLP/HTTP to the Alloy agent on their own node
+# (OTEL_EXPORTER_OTLP_ENDPOINT=http://$(NODE_IP):4318, a hostPort). Two rules because
+# implementations differ on whether they match the node address or, after the hostPort
+# DNAT, the Alloy pod -- allowing both keeps tracing working either way.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-otlp-egress
+  namespace: ecommerce-dev
+spec:
+  podSelector:
+    matchExpressions:
+      - { key: app, operator: In, values: [user-service, product-service, order-service] }
+  policyTypes: [Egress]
+  egress:
+    - to:
+        # The kind Docker network the nodes live on (docker network inspect kind).
+        - ipBlock:
+            cidr: 172.18.0.0/16
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: monitoring
+          podSelector:
+            matchLabels:
+              app.kubernetes.io/name: alloy
+      ports:
+        - { protocol: TCP, port: 4318 }
+---
+# Prometheus scrapes /metrics on each service's own port.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-prometheus-scrape
+  namespace: ecommerce-dev
+spec:
+  podSelector:
+    matchExpressions:
+      - { key: app, operator: In, values: [user-service, product-service, order-service] }
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: monitoring
+          podSelector:
+            matchLabels:
+              app.kubernetes.io/name: prometheus
+      ports:
+        - { protocol: TCP, port: 3001 }
+        - { protocol: TCP, port: 3002 }
+        - { protocol: TCP, port: 3003 }
+---
+# frontend: reachable ONLY from the ingress controller (so the Ingress rate limit cannot
+# be bypassed); may call the three services and nothing else.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: frontend
+  namespace: ecommerce-dev
+spec:
+  podSelector:
+    matchLabels:
+      app: frontend
+  policyTypes: [Ingress, Egress]
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: ingress-nginx
+          podSelector:
+            matchLabels:
+              app.kubernetes.io/name: ingress-nginx
+      ports:
+        - { protocol: TCP, port: 8080 }
+  egress:
+    - to:
+        - podSelector: { matchLabels: { app: user-service } }
+      ports: [{ protocol: TCP, port: 3001 }]
+    - to:
+        - podSelector: { matchLabels: { app: product-service } }
+      ports: [{ protocol: TCP, port: 3002 }]
+    - to:
+        - podSelector: { matchLabels: { app: order-service } }
+      ports: [{ protocol: TCP, port: 3003 }]
+---
+# user-service: called by the frontend; calls product-service (wishlist checks) and Redis.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: user-service
+  namespace: ecommerce-dev
+spec:
+  podSelector:
+    matchLabels:
+      app: user-service
+  policyTypes: [Ingress, Egress]
+  ingress:
+    - from:
+        - podSelector: { matchLabels: { app: frontend } }
+        # order-service has USER_SERVICE_URL configured.
+        - podSelector: { matchLabels: { app: order-service } }
+      ports: [{ protocol: TCP, port: 3001 }]
+  egress:
+    - to:
+        - podSelector: { matchLabels: { app: product-service } }
+      ports: [{ protocol: TCP, port: 3002 }]
+    - to:
+        - podSelector: { matchLabels: { app: redis } }
+      ports: [{ protocol: TCP, port: 6379 }]
+---
+# product-service: called by the frontend and by the other two services. Calls only Redis
+# (stock and reservations since v2.8); Cosmos DB egress gets added on AKS.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: product-service
+  namespace: ecommerce-dev
+spec:
+  podSelector:
+    matchLabels:
+      app: product-service
+  policyTypes: [Ingress, Egress]
+  ingress:
+    - from:
+        - podSelector: { matchLabels: { app: frontend } }
+        - podSelector: { matchLabels: { app: user-service } }
+        - podSelector: { matchLabels: { app: order-service } }
+      ports: [{ protocol: TCP, port: 3002 }]
+  egress:
+    - to:
+        - podSelector: { matchLabels: { app: redis } }
+      ports: [{ protocol: TCP, port: 6379 }]
+---
+# order-service: called by the frontend; calls product-service (prices, stock),
+# user-service and Redis.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: order-service
+  namespace: ecommerce-dev
+spec:
+  podSelector:
+    matchLabels:
+      app: order-service
+  policyTypes: [Ingress, Egress]
+  ingress:
+    - from:
+        - podSelector: { matchLabels: { app: frontend } }
+      ports: [{ protocol: TCP, port: 3003 }]
+  egress:
+    - to:
+        - podSelector: { matchLabels: { app: product-service } }
+      ports: [{ protocol: TCP, port: 3002 }]
+    - to:
+        - podSelector: { matchLabels: { app: user-service } }
+      ports: [{ protocol: TCP, port: 3001 }]
+    - to:
+        - podSelector: { matchLabels: { app: redis } }
+      ports: [{ protocol: TCP, port: 6379 }]
+---
+# redis: ONLY the three services that own state. Redis here has no password, so this
+# policy is what actually protects the data on kind.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: redis
+  namespace: ecommerce-dev
+spec:
+  podSelector:
+    matchLabels:
+      app: redis
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - podSelector: { matchLabels: { app: user-service } }
+        - podSelector: { matchLabels: { app: order-service } }
+        - podSelector: { matchLabels: { app: product-service } }
+      ports: [{ protocol: TCP, port: 6379 }]

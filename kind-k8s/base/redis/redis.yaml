@@ -1,0 +1,136 @@
+# Redis — the shared state store for user-service and order-service.
+#
+# WHY THIS EXISTS
+# ---------------
+# Both services used to keep carts, accounts and wishlists in a `new Map()` inside
+# the Node process. That is only correct with ONE replica. At 2 replicas Kubernetes
+# round-robins requests, so:
+#   - a cart written on pod A was invisible on pod B -> "Cart is empty" at checkout
+#   - an account registered on pod A did not exist on pod B -> "Invalid email or password"
+# Both failed roughly half the time. Moving that state here makes every replica read
+# and write one copy.
+#
+# A StatefulSet, not a Deployment. A Deployment's pods get random names and any
+# volume is shared between them; a StatefulSet gives a stable name (redis-0) and its
+# own PersistentVolumeClaim, which is what a datastore needs.
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: redis
+  namespace: ecommerce-dev
+  labels:
+    app: redis
+spec:
+  # A normal ClusterIP is all that is needed: one replica, so there is nothing to
+  # discover individually. (A Redis cluster or replica set would want a headless
+  # Service so clients can address each member by name.)
+  type: ClusterIP
+  selector:
+    app: redis
+  ports:
+    - name: redis
+      port: 6379
+      targetPort: 6379
+      protocol: TCP
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: redis
+  namespace: ecommerce-dev
+  labels:
+    app: redis
+spec:
+  serviceName: redis
+  # ONE replica, deliberately. Redis replication is asynchronous, so a read from a
+  # replica can miss a write that just succeeded on the primary -- which would
+  # reintroduce the exact "cart looks empty" symptom this is here to fix, just less
+  # often and far harder to debug. Real HA needs Sentinel or Redis Cluster, which is
+  # well beyond a local kind cluster.
+  replicas: 1
+  selector:
+    matchLabels:
+      app: redis
+  template:
+    metadata:
+      labels:
+        app: redis
+    spec:
+      securityContext:
+        # The official redis image creates the redis user as 999:1000. fsGroup makes
+        # the mounted volume group-writable by that user, otherwise Redis cannot
+        # write its append-only file and exits.
+        runAsNonRoot: true
+        runAsUser: 999
+        runAsGroup: 1000
+        fsGroup: 1000
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: redis
+          image: redis:7.4-alpine
+          imagePullPolicy: IfNotPresent
+          args:
+            # AOF (append-only file) persistence: every write is journaled, so a pod
+            # restart replays them instead of losing every cart. The default RDB
+            # snapshotting would lose up to several minutes of writes.
+            - "--appendonly"
+            - "yes"
+            # Cap memory so a runaway number of carts cannot evict the node's other
+            # pods. Must stay below the container limit below.
+            - "--maxmemory"
+            - "200mb"
+            # When that cap is hit, drop the least-recently-used key rather than
+            # refusing writes. A forgotten cart disappearing is far better than
+            # every checkout starting to fail with OOM errors.
+            - "--maxmemory-policy"
+            - "allkeys-lru"
+          ports:
+            - name: redis
+              containerPort: 6379
+              protocol: TCP
+          # redis-cli PING is the honest check: it proves the server is answering
+          # commands, not merely that the port is open.
+          livenessProbe:
+            exec:
+              command: ["redis-cli", "ping"]
+            initialDelaySeconds: 15
+            periodSeconds: 20
+            timeoutSeconds: 5
+            failureThreshold: 3
+          readinessProbe:
+            exec:
+              command: ["redis-cli", "ping"]
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 3
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              # Above --maxmemory 200mb, leaving room for Redis's own overhead and
+              # the AOF buffer. Too tight here and the kernel OOMKills the pod
+              # before Redis's own eviction policy ever gets a chance to run.
+              memory: 320Mi
+          securityContext:
+            readOnlyRootFilesystem: true
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - name: data
+              mountPath: /data
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        # kind's built-in local-path provisioner. The volume is a directory on one
+        # node, so redis-0 always reschedules back onto that node.
+        storageClassName: standard
+        resources:
+          requests:
+            storage: 1Gi

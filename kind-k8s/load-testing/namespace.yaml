@@ -1,0 +1,6 @@
+# Own namespace so the load generator never shows up in the app's own dashboards,
+# ServiceMonitors or HPA math for ecommerce-dev.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: load-testing

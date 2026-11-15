@@ -1,0 +1,32 @@
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: user-service
+  namespace: ecommerce-dev
+spec:
+  # 3 on kind (was 6 in git, raised live to 10): every kind node shares the same 10
+  # laptop CPUs, so more replicas add contention, not capacity. At 10 per service the
+  # HPAs alone could ask for more CPU than the Docker VM has, which starved the control
+  # plane and Prometheus. AKS keeps its own sizing (aks-k8s/), where nodes are real VMs.
+  maxReplicas: 3
+  metrics:
+  - resource:
+      name: cpu
+      target:
+        averageUtilization: 65
+        type: Utilization
+    type: Resource
+  - resource:
+      name: memory
+      target:
+        averageUtilization: 75
+        type: Utilization
+    type: Resource    
+  minReplicas: 2
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: user-service
+  behavior:
+    scaleDown:
+      stabilizationWindowSeconds: 300

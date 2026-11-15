@@ -1,0 +1,110 @@
+# Continuous k6 load generator (roadmap 9.1).
+#
+# A Deployment rather than a CronJob: the point is ALWAYS-ON background traffic, so SLIs
+# have something to measure and alerts have something to fire on. Each run lasts DURATION
+# (24h); when k6 exits the container restarts and a fresh run begins.
+#
+# Metrics: k6 pushes its own client-side metrics to Prometheus over remote-write (needs
+# prometheusSpec.enableRemoteWriteReceiver, see monitoring/kube-prometheus-stack-values.yaml).
+# They show up as k6_* series -- see the "k6 load test" dashboard in Grafana.
+#
+# Day-to-day:
+#   pause      kubectl scale deploy/k6-load -n load-testing --replicas=0
+#   resume     kubectl scale deploy/k6-load -n load-testing --replicas=1
+#   more load  kubectl set env deploy/k6-load -n load-testing RATE=3
+#   checkout   kubectl set env deploy/k6-load -n load-testing CHECKOUT_PER_MIN=6
+#   summary    kubectl logs deploy/k6-load -n load-testing --previous   (after a run ends)
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: k6-load
+  labels:
+    app: k6-load
+spec:
+  replicas: 1
+  # Never run two generators at once during a rollout -- that would silently double the
+  # load and both would register their own users.
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: k6-load
+  template:
+    metadata:
+      labels:
+        app: k6-load
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 12345 # the k6 image's own user
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: k6
+          image: grafana/k6:2.3.0
+          args:
+            - run
+            - --quiet # no per-second progress bar in the logs; the end-of-run summary stays
+            - --no-usage-report
+            - --out=experimental-prometheus-rw
+            # Tag every series with the pod name, so one run can be told from the next
+            # (the "testid" variable on the dashboard).
+            - --tag=testid=$(POD_NAME)
+            - /scripts/script.js
+          env:
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            # --- what to hit, and how hard (see script.js header) ---
+            - name: BASE_URL
+              # Through the ingress controller, exactly the path a browser takes, so the
+              # ingress and the frontend's nginx are part of what gets measured.
+              value: http://ingress-nginx-controller.ingress-nginx.svc.cluster.local
+            # 0.5 on this laptop cluster: ~11 req/s instead of ~22. At 1 the run (plus the
+            # autoscaling it triggered) kept the Docker VM at its 10-CPU limit overnight.
+            - name: RATE
+              value: "0.5"
+            - name: DURATION
+              value: 24h
+            # 6 (the value previously set live with kubectl set env) now lives in git, so a
+            # re-apply no longer silently turns checkouts off. RATE scales it: 3/min at 0.5.
+            - name: CHECKOUT_PER_MIN
+              value: "6"
+            # --- where metrics go ---
+            - name: K6_PROMETHEUS_RW_SERVER_URL
+              value: http://kps-kube-prometheus-stack-prometheus.monitoring.svc.cluster.local:9090/api/v1/write
+            # Latency as a native histogram, so Grafana can compute p95 over ANY window with
+            # histogram_quantile(). The alternative (trend stats like p95 as gauges) is
+            # computed over the whole run -- after a few hours of a 24h run it barely moves,
+            # and a 5-minute slowdown would be invisible.
+            # (k6 2.x spelling; K6_PROMETHEUS_RW_TREND_AS_NATIVE_HISTOGRAM is the old alias.)
+            - name: K6_FEATURES
+              value: native-histograms
+            # End the series cleanly when a run stops instead of leaving flat lines for 5m.
+            - name: K6_PROMETHEUS_RW_STALE_MARKERS
+              value: "true"
+            # Default system tags include `url`, which has one value per product id -> one
+            # time series per product. `name` (set in script.js) replaces it.
+            - name: K6_SYSTEM_TAGS
+              value: status,method,name,group,check,error_code,expected_response,scenario
+          volumeMounts:
+            - name: scripts
+              mountPath: /scripts
+              readOnly: true
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: "1"
+              memory: 512Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+      volumes:
+        - name: scripts
+          configMap:
+            name: k6-script

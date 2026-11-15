@@ -1,0 +1,284 @@
+# Grafana Alloy as the GATEWAY tier of the trace pipeline.
+#
+# Chart: grafana/alloy 1.15.0 (Alloy v1.21.x), the same chart as the agent, but deployed
+# as a Deployment rather than a DaemonSet and with a different config.
+#
+# Install:
+#   kubectl apply -f alloy-gateway-headless-svc.yaml
+#   helm upgrade --install alloy-gateway grafana/alloy -n monitoring --version 1.15.0 \
+#     -f alloy-gateway-values.yaml
+#
+# WHY TWO TIERS
+# -------------
+# The agents (alloy-values.yaml) run on every node and do only what needs node-locality:
+# receive from local pods, stamp on Kubernetes identity, batch. This gateway does what needs
+# either the WHOLE trace in one place, or credentials that should not sit on every node:
+#
+#   otelcol.receiver.otlp            from the agents (gRPC 4317)
+#          |
+#   otelcol.processor.memory_limiter FIRST, same rule as the agent
+#          |
+#   otelcol.processor.attributes     scrub anything that must never leave the cluster
+#          |
+#   otelcol.processor.tail_sampling  keep every error, everything slow, 10% of the rest
+#          |
+#   otelcol.processor.batch          LAST
+#          |
+#   otelcol.exporter.otlp            Tempo
+#
+# Phase 10 adds vendor fan-out here, which is why the vendor credentials will live on this
+# one Deployment and not on every node's agent.
+
+alloy:
+  configMap:
+    create: true
+    content: |-
+      // -----------------------------------------------------------------------------------
+      // 1. Receive from the agents
+      // -----------------------------------------------------------------------------------
+      // gRPC only. The agents' loadbalancing exporter speaks OTLP/gRPC; nothing else sends
+      // here. No HTTP listener means no accidental second path that bypasses sampling.
+      otelcol.receiver.otlp "agents" {
+        grpc {
+          endpoint = "0.0.0.0:4317"
+        }
+
+        output {
+          traces = [otelcol.processor.memory_limiter.default.input]
+        }
+      }
+
+      // -----------------------------------------------------------------------------------
+      // 2. Memory limiter -- first, same reasoning as the agent
+      // -----------------------------------------------------------------------------------
+      // Tail sampling makes this MORE important here than on the agent: it has to HOLD
+      // every span of every in-flight trace for decision_wait seconds before deciding.
+      // That buffer is bounded by num_traces below, but a burst of large traces can still
+      // outgrow the pod. Shed first.
+      otelcol.processor.memory_limiter "default" {
+        check_interval = "1s"
+        limit          = "400MiB"
+        spike_limit    = "100MiB"
+
+        output {
+          traces = [otelcol.processor.attributes.scrub.input]
+        }
+      }
+
+      // -----------------------------------------------------------------------------------
+      // 3. Scrub attributes that must never leave the cluster
+      // -----------------------------------------------------------------------------------
+      // The SDK is NOT configured to capture request headers, so today no Authorization
+      // header reaches a span. This processor is the guarantee that stays true if someone
+      // later turns header capture on, or adds a span attribute carrying an email by hand.
+      // It runs BEFORE tail sampling so a sampled-out trace never even holds the value in
+      // the decision buffer, and before any exporter -- including the vendor fan-out that
+      // phase 10 adds here.
+      //
+      // `pattern` is a regular expression matched against attribute KEYS. The email rule
+      // deletes any attribute whose key mentions email, whatever the value.
+      otelcol.processor.attributes "scrub" {
+        action {
+          key    = "http.request.header.authorization"
+          action = "delete"
+        }
+        action {
+          key    = "http.request.header.cookie"
+          action = "delete"
+        }
+        action {
+          key    = "http.response.header.set-cookie"
+          action = "delete"
+        }
+        action {
+          pattern = "(?i).*email.*"
+          action  = "delete"
+        }
+        action {
+          pattern = "(?i).*password.*"
+          action  = "delete"
+        }
+
+        output {
+          traces = [otelcol.processor.tail_sampling.default.input]
+        }
+      }
+
+      // -----------------------------------------------------------------------------------
+      // 4. Tail sampling
+      // -----------------------------------------------------------------------------------
+      // HEAD sampling decides at the START of a trace, in the SDK, by flipping a coin on
+      // the trace id. It is cheap and needs no buffering, but it decides before the
+      // outcome is known, so it keeps 10% of the errors and 10% of the slow requests --
+      // the ones you actually want -- and throws the other 90% away.
+      //
+      // TAIL sampling decides at the END, once every span of the trace has arrived. That
+      // is what makes "keep 100% of errors" possible at all: the error is only visible
+      // after the fact. The price is the buffer -- every span of every trace is held for
+      // decision_wait, and all spans of one trace must land on the SAME gateway instance
+      // (see the loadbalancing exporter in alloy-values.yaml for what breaks otherwise).
+      //
+      // Policies are OR-ed: a trace is kept if ANY policy says keep.
+      otelcol.processor.tail_sampling "default" {
+        // How long to wait for the last span of a trace before deciding. Must exceed the
+        // longest realistic request (checkout here is well under a second) plus the agent's
+        // 5s batch timeout, or late spans arrive after the decision and are dropped.
+        decision_wait = "15s"
+
+        // Upper bound on traces held in memory at once. Beyond this, the oldest are
+        // decided early. Sized for this cluster's rate with wide margin.
+        num_traces = 50000
+
+        // 1. Every trace containing a span with status ERROR. The Node SDK sets this on
+        //    server spans for 5xx responses and on client spans for failed outbound calls.
+        policy {
+          name = "keep-all-errors"
+          type = "status_code"
+          status_code {
+            status_codes = ["ERROR"]
+          }
+        }
+
+        // 2. Every trace with a 5xx response, by status attribute. Belt and braces with (1),
+        //    because span status depends on each instrumentation's conventions while the
+        //    status code is a plain number. Two attribute names because the SERVER spans use
+        //    the older http.status_code and the outbound CLIENT spans (undici) already use
+        //    the stable http.response.status_code -- both are present on this cluster.
+        policy {
+          name = "keep-5xx-server"
+          type = "numeric_attribute"
+          numeric_attribute {
+            key       = "http.status_code"
+            min_value = 500
+            max_value = 599
+          }
+        }
+        policy {
+          name = "keep-5xx-client"
+          type = "numeric_attribute"
+          numeric_attribute {
+            key       = "http.response.status_code"
+            min_value = 500
+            max_value = 599
+          }
+        }
+
+        // 3. Everything slower than the latency SLO threshold. 500ms is a boundary of the
+        //    services' histogram buckets ([..., 0.25, 0.5, 1, ...] in metrics.ts) so the
+        //    same threshold can be expressed as a PromQL SLI; keep the two in step when
+        //    the SLO document (phase 3.2) is written. Measured on the trace's root span.
+        policy {
+          name = "keep-slow"
+          type = "latency"
+          latency {
+            threshold_ms = 500
+          }
+        }
+
+        // 4. A flat 10% of whatever is left, so the normal case is still represented and
+        //    the service graph and span metrics (phase 8) have something to compute from.
+        //    THIS is what "sampled at 10%" costs: a customer's specific SUCCESSFUL request
+        //    is findable only 1 time in 10. If that answer must be yes, the fix is not a
+        //    higher percentage -- it is putting the trace id in the response (and the logs)
+        //    and a policy keyed on an explicit "please keep" attribute.
+        policy {
+          name = "baseline-10pct"
+          type = "probabilistic"
+          probabilistic {
+            sampling_percentage = 10
+          }
+        }
+
+        output {
+          traces = [otelcol.processor.batch.default.input]
+        }
+      }
+
+      // -----------------------------------------------------------------------------------
+      // 5. Batch -- last
+      // -----------------------------------------------------------------------------------
+      otelcol.processor.batch "default" {
+        send_batch_size = 1024
+        timeout         = "5s"
+
+        output {
+          traces = [otelcol.exporter.otlp.tempo.input]
+        }
+      }
+
+      // -----------------------------------------------------------------------------------
+      // 6. Send to Tempo
+      // -----------------------------------------------------------------------------------
+      // Note this is a CLIENT (`client` block, host:port) while loki.write took a full URL.
+      // OTLP/gRPC addresses a host and port, not an HTTP path. insecure = true is plaintext
+      // gRPC, not "skip certificate verification".
+      otelcol.exporter.otlp "tempo" {
+        client {
+          endpoint = "tempo.monitoring.svc.cluster.local:4317"
+
+          tls {
+            insecure = true
+          }
+        }
+
+        // A send that fails is retried with backoff and queued meanwhile. If Tempo is down
+        // longer than the queue holds, spans are dropped -- visible in
+        // otelcol_exporter_send_failed_spans_total, which is worth an alert later.
+        retry_on_failure {
+          enabled = true
+        }
+      }
+
+  # The gateway reads no files on the node, so unlike the agent it has no reason to run as
+  # root. 473 is the `alloy` user baked into the image (checked with `id` in the container).
+  securityContext:
+    runAsNonRoot: true
+    runAsUser: 473
+    runAsGroup: 473
+    allowPrivilegeEscalation: false
+    capabilities:
+      drop: ["ALL"]
+    seccompProfile:
+      type: RuntimeDefault
+
+  # No /var/log mount: nothing here reads logs.
+  mounts:
+    varlog: false
+    dockercontainers: false
+
+  # 4317 is where the agents send. Added to the container and to the chart's (ClusterIP)
+  # Service; the agents do NOT use that Service -- they use the headless one in
+  # alloy-gateway-headless-svc.yaml so that they can address each replica individually.
+  extraPorts:
+    - name: otlp-grpc
+      port: 4317
+      targetPort: 4317
+      protocol: TCP
+      appProtocol: h2c
+
+  resources:
+    requests:
+      cpu: 100m
+      memory: 128Mi
+    limits:
+      # Above memory_limiter.limit (400MiB) so the limiter sheds load before the kernel
+      # OOMKills the pod.
+      memory: 640Mi
+
+  enableReporting: false
+
+controller:
+  # A Deployment: the gateway is a plain stateless-looking service that can be scaled and
+  # rescheduled freely... with one trap. Its tail-sampling buffer is per-replica, so all
+  # spans of one trace MUST reach the same replica. Scaling this to 3 behind a normal
+  # Service would scatter each trace across replicas and silently break sampling. The
+  # agents therefore route by trace id to the HEADLESS Service -- see alloy-values.yaml.
+  # With that in place, raising replicas here is safe.
+  type: deployment
+  replicas: 1
+
+serviceMonitor:
+  # The gateway's own metrics into Prometheus. The two that prove tail sampling works:
+  #   otelcol_processor_tail_sampling_count_traces_sampled{policy, sampled}
+  #   otelcol_processor_tail_sampling_sampling_decision_latency
+  enabled: true

@@ -1,0 +1,80 @@
+# Prometheus scraping for the ingress-nginx controller.
+#
+# WHY THIS FILE EXISTS
+# --------------------
+# The controller is installed from the upstream kind manifest (README step 4), which ships
+# no metrics Service and no ServiceMonitor. Worse, from ingress-nginx 1.15 the controller
+# flag --enable-metrics no longer defaults to true: /metrics on :10254 serves only Go
+# runtime series (go_*, process_*) and NO nginx_ingress_controller_* series at all. Checked
+# on this cluster with `nginx-ingress-controller --help` (no "(default true)") and by
+# grepping /metrics for nginx_ingress_controller_ (0 lines).
+#
+# Two steps are therefore needed, in this order:
+#
+# 1. Turn metrics on in the controller (restarts the single controller pod, so the app is
+#    unreachable on localhost for a few seconds):
+#
+#    kubectl patch deploy ingress-nginx-controller -n ingress-nginx --type=json -p='[
+#      {"op":"add","path":"/spec/template/spec/containers/0/args/-","value":"--enable-metrics=true"},
+#      {"op":"add","path":"/spec/template/spec/containers/0/args/-","value":"--metrics-per-host=false"}]'
+#
+#    --metrics-per-host=false matters as much as enabling metrics. The ecommerce Ingress has
+#    no `host:` rule (it is the catch-all on localhost), and per-host metrics DROP requests
+#    to hosts no Ingress declares -- so with the default, only grafana.localhost showed up
+#    and the shop's own traffic was invisible. The other way out, --metrics-per-undefined-
+#    host=true, would turn every distinct Host header a client sends into new series: an
+#    unbounded cardinality hole anyone on the internet can drive. Dropping the host label
+#    keeps cardinality bounded; the `ingress` label still tells the apps apart.
+#
+#    This edits a resource that the upstream manifest owns. Re-applying that manifest
+#    (README step 4) silently REMOVES the flag again, and the ingress dashboard row goes
+#    blank. Re-run the patch after any re-install.
+#
+# 2. kubectl apply -f this file: a Service that exposes :10254, and a ServiceMonitor that
+#    tells Prometheus to scrape it.
+#
+# Why a Service + ServiceMonitor rather than a PodMonitor: a PodMonitor selects a NAMED
+# container port, and the upstream manifest's controller container does not declare 10254
+# at all. A Service can target the bare port number without touching the Deployment.
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: ingress-nginx-controller-metrics
+  namespace: ingress-nginx
+  labels:
+    app.kubernetes.io/name: ingress-nginx
+    app.kubernetes.io/component: controller-metrics
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: ingress-nginx
+    app.kubernetes.io/instance: ingress-nginx
+    app.kubernetes.io/component: controller
+  ports:
+    - name: metrics
+      port: 10254
+      targetPort: 10254
+      protocol: TCP
+---
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: ingress-nginx-controller
+  # Lives next to the other ServiceMonitors. Your Prometheus selects ServiceMonitors in
+  # every namespace (serviceMonitorNamespaceSelector: {}), so this is a convention, not a
+  # requirement.
+  namespace: monitoring
+spec:
+  # The job label becomes "ingress-nginx-controller-metrics" (the Service name); the
+  # dashboard's ingress row filters on it.
+  namespaceSelector:
+    matchNames:
+      - ingress-nginx
+  selector:
+    matchLabels:
+      app.kubernetes.io/component: controller-metrics
+  endpoints:
+    - port: metrics
+      path: /metrics
+      interval: 60s   # matches prometheusSpec.scrapeInterval (kube-prometheus-stack-values.yaml)

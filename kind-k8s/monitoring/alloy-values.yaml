@@ -1,0 +1,513 @@
+# Grafana Alloy as the logs AND traces collector for a local kind cluster.
+#
+# Chart: grafana/alloy 1.15.0 (Alloy v1.21.x). Keys below were checked against that version's
+# defaults (`helm show values grafana/alloy --version 1.15.0`). Helm silently ignores keys it
+# does not recognise, so a typo here fails without an error.
+#
+# Install:
+#   helm upgrade --install alloy grafana/alloy -n monitoring --version 1.15.0 -f alloy-values.yaml
+#
+# Result: a DaemonSet, one Alloy pod per node (3 on this cluster, control plane included).
+# Each pod reads the container log files of ITS OWN node and pushes them to Loki at
+#   http://loki.monitoring.svc.cluster.local:3100/loki/api/v1/push
+#
+# The pipeline, one component per step, each feeding the next:
+#
+#   discovery.kubernetes   which pods run on this node?
+#          |
+#   discovery.relabel      Kubernetes metadata -> Loki labels, and the log file path
+#          |
+#   local.file_match       glob pattern -> actual files on disk
+#          |
+#   loki.source.file       follow each file (like tail -f), remember the read position
+#          |
+#   loki.process           strip containerd's line prefix (stage.cri)
+#          |
+#   loki.write             push to Loki
+#
+# A SECOND, INDEPENDENT pipeline handles traces. Alloy runs both at once; they share no
+# components and neither can block the other:
+#
+#   otelcol.receiver.otlp             apps on THIS node push spans here (hostPort 4317/4318)
+#          |
+#   otelcol.processor.memory_limiter  FIRST: shed load before anything else allocates
+#          |
+#   otelcol.processor.k8sattributes   add namespace/pod/deployment to each span
+#          |
+#   otelcol.processor.batch           LAST: group spans into fewer, larger writes
+#          |
+#   otelcol.exporter.loadbalancing    forward to the GATEWAY tier, routed by trace id
+#                                      (alloy-gateway-values.yaml: tail sampling, scrubbing, Tempo)
+#
+# This is the AGENT tier of a two-tier collector layout. The agent runs on every node and
+# does only what needs node-locality: receive from local pods and stamp on Kubernetes
+# identity. Anything that needs the WHOLE trace in one place (tail sampling) or credentials
+# that should not sit on every node (vendor fan-out, later) lives in the gateway.
+#
+# The direction is the key difference from logs. Logs are PULLED: Alloy reads files off its
+# own node, so it must be a DaemonSet. Traces are PUSHED: the app opens a connection to
+# Alloy. That makes the network path, not the disk, the thing to get right -- see
+# alloy.extraPorts below.
+#
+# Debug UI: kubectl port-forward -n monitoring <an-alloy-pod> 12345, open http://localhost:12345.
+# It draws this graph and shows each component's health, inputs and outputs.
+
+alloy:
+  configMap:
+    # The chart writes `content` to a ConfigMap mounted at /etc/alloy/config.alloy. A sidecar
+    # (config-reloader) watches it and tells Alloy to reload, so a `helm upgrade` that only
+    # changes this text takes effect without restarting the pods.
+    create: true
+    content: |-
+      // -----------------------------------------------------------------------------------
+      // 1. Discover the pods on THIS node
+      // -----------------------------------------------------------------------------------
+      // Watches the Kubernetes API for pods. Every pod container becomes a "target": a set
+      // of __meta_kubernetes_* labels (namespace, pod name, uid, container, pod labels...).
+      discovery.kubernetes "pods" {
+        role = "pod"
+
+        // Ask the API server only for pods scheduled on this node. Each Alloy pod can read
+        // log files only from its own node's disk, and without this filter all three pods
+        // would try to collect every pod in the cluster.
+        //
+        // HOSTNAME is set by the chart to the node name (fieldRef: spec.nodeName), not to the
+        // pod's own hostname. constants.hostname is a fallback if it is ever missing.
+        selectors {
+          role  = "pod"
+          field = "spec.nodeName=" + coalesce(sys.env("HOSTNAME"), constants.hostname)
+        }
+      }
+
+      // -----------------------------------------------------------------------------------
+      // 2. Turn Kubernetes metadata into Loki labels, and build the log file path
+      // -----------------------------------------------------------------------------------
+      // Every label becomes part of the stream's identity and is indexed. Keep only labels
+      // with FEW possible values. Never add path, status, user id or trace id here; those
+      // stay inside the log line and are parsed at query time with `| json`.
+      discovery.relabel "pod_logs" {
+        targets = discovery.kubernetes.pods.targets
+
+        rule {
+          source_labels = ["__meta_kubernetes_namespace"]
+          target_label  = "namespace"
+        }
+
+        rule {
+          source_labels = ["__meta_kubernetes_pod_name"]
+          target_label  = "pod"
+        }
+
+        rule {
+          source_labels = ["__meta_kubernetes_pod_container_name"]
+          target_label  = "container"
+        }
+
+        // "app": prefer the standard app.kubernetes.io/name label (used by Helm charts such
+        // as Grafana and Loki), then let the plain `app` label override it. Your own
+        // Deployments use `app: product-service`, so your services get app="product-service",
+        // which is what your RED dashboard's Logs panel will filter on.
+        //
+        // Label names with dots or slashes are converted to underscores in __meta labels:
+        // app.kubernetes.io/name -> __meta_kubernetes_pod_label_app_kubernetes_io_name
+        rule {
+          source_labels = ["__meta_kubernetes_pod_label_app_kubernetes_io_name"]
+          target_label  = "app"
+        }
+        rule {
+          source_labels = ["__meta_kubernetes_pod_label_app"]
+          // (.+) matches only a non-empty value, so a pod without an `app` label keeps the
+          // value set by the rule above instead of having it overwritten with "".
+          regex         = "(.+)"
+          target_label  = "app"
+        }
+
+        // The node name: 3 values on this cluster, so cheap, and useful when one node
+        // misbehaves.
+        rule {
+          source_labels = ["__meta_kubernetes_pod_node_name"]
+          target_label  = "node"
+        }
+
+        // Where the kubelet/containerd writes this container's stdout and stderr:
+        //   /var/log/pods/<namespace>_<pod>_<pod-uid>/<container>/<restart-count>.log
+        // The two source labels are joined with "/" into "<uid>/<container>", and $1 is
+        // put into the pattern. The leading * matches "<namespace>_<pod>_". The trailing
+        // *.log matches 0.log, 1.log, ... (one file per container restart) but not rotated
+        // files like 0.log.20261027-090609 or 0.log.<date>.gz.
+        //
+        // __path__ starts with "__", so it is used by local.file_match below and never
+        // sent to Loki as a label.
+        rule {
+          source_labels = ["__meta_kubernetes_pod_uid", "__meta_kubernetes_pod_container_name"]
+          separator     = "/"
+          target_label  = "__path__"
+          replacement   = "/var/log/pods/*$1/*.log"
+        }
+      }
+
+      // -----------------------------------------------------------------------------------
+      // 3. Expand the path patterns into real files
+      // -----------------------------------------------------------------------------------
+      // Re-checks the disk every 10s by default, so a container restart (new 1.log, 2.log)
+      // is picked up automatically.
+      local.file_match "pod_logs" {
+        path_targets = discovery.relabel.pod_logs.output
+      }
+
+      // -----------------------------------------------------------------------------------
+      // 4. Read the files
+      // -----------------------------------------------------------------------------------
+      loki.source.file "pod_logs" {
+        targets    = local.file_match.pod_logs.targets
+        forward_to = [loki.process.pod_logs.receiver]
+
+        // For a file Alloy has never seen, start at the END instead of the beginning.
+        // Your nodes hold files weeks old (e.g. product-service's 0.log from Oct 27), and
+        // Loki rejects lines older than a week ("entry too far behind" / "greater than max
+        // sample age"). Starting at the end ships only new lines.
+        //
+        // Applies only to files with no saved position. Once Alloy has a position for a file
+        // it resumes from there. Positions are kept in the chart's storagePath
+        // (/tmp/alloy), which is not persistent: after an Alloy pod restart it starts at
+        // the end again, so lines written while it was down are skipped. Production setups
+        // keep positions on a hostPath volume for that reason.
+        tail_from_end = true
+      }
+
+      // -----------------------------------------------------------------------------------
+      // 5. Process each line
+      // -----------------------------------------------------------------------------------
+      loki.process "pod_logs" {
+        forward_to = [loki.write.loki.receiver]
+
+        // kind runs containerd, which writes every line in the CRI format:
+        //   2026-10-27T09:06:10.049Z stdout F {"ts":"...","level":"info",...}
+        //   <timestamp>              <stream> <flag> <the line your app wrote>
+        // stage.cri parses that: the line's timestamp becomes the entry's timestamp, the
+        // prefix is removed, and lines containerd split at 16 KB (flag P = partial) are
+        // joined back together. Without it, `| json` fails on every line in Grafana.
+        stage.cri {}
+
+        // OPTIONAL: make `level` a label for your own services only. It has 3 values
+        // (info, warn, error), so it is safe on cardinality, and {level="error"} is then
+        // answered from the index. The alternative, which needs nothing here, is to filter
+        // at query time with `| json | level="error"`. Uncomment to try it.
+        //
+        // stage.match is used because only ecommerce-dev writes JSON; other namespaces'
+        // plain-text lines would otherwise fail the json stage.
+        //
+        // stage.match {
+        //   selector = "{namespace=\"ecommerce-dev\"}"
+        //
+        //   stage.json {
+        //     expressions = { level = "level" }
+        //   }
+        //
+        //   stage.labels {
+        //     values = { level = "" }
+        //   }
+        // }
+      }
+
+      // -----------------------------------------------------------------------------------
+      // 6. Send to Loki
+      // -----------------------------------------------------------------------------------
+      loki.write "loki" {
+        endpoint {
+          // The `loki` Service directly on 3100, because loki-values.yaml disables the gateway.
+          url = "http://loki.monitoring.svc.cluster.local:3100/loki/api/v1/push"
+        }
+
+        // Added to every stream this Alloy sends. Pointless with one cluster, but it is the
+        // convention once several clusters ship to one Loki, and it costs nothing.
+        external_labels = {
+          cluster = "kind-ecommerce-local",
+        }
+      }
+
+      // #####################################################################################
+      // TRACES PIPELINE -- entirely separate from the logs pipeline above.
+      // #####################################################################################
+
+      // -----------------------------------------------------------------------------------
+      // 7. Receive spans from the applications
+      // -----------------------------------------------------------------------------------
+      // This is a SERVER: it listens, and the apps connect to it. Nothing here discovers or
+      // scrapes anything, which is why no Kubernetes metadata is available yet at this stage.
+      //
+      // Two protocols, because OTLP is defined over both and SDKs differ in their default:
+      //   4317  OTLP/gRPC  -- the default for the Node.js SDK; binary, multiplexed, efficient
+      //   4318  OTLP/HTTP  -- protobuf over HTTP/1.1; what browsers and curl can speak
+      // Enabling both costs nothing and avoids a silent mismatch later.
+      //
+      // 0.0.0.0 not 127.0.0.1: the connection arrives from another pod, so binding to
+      // localhost would accept nothing from outside the container.
+      otelcol.receiver.otlp "default" {
+        grpc {
+          endpoint = "0.0.0.0:4317"
+        }
+
+        http {
+          endpoint = "0.0.0.0:4318"
+        }
+
+        // Alloy components are wired explicitly: a receiver names the next component's
+        // `input`, per signal. Only `traces` is wired, so metrics or logs arriving over OTLP
+        // are accepted and then dropped. Wire them later if an app starts sending them.
+        output {
+          traces = [otelcol.processor.memory_limiter.default.input]
+        }
+      }
+
+      // -----------------------------------------------------------------------------------
+      // 8. Protect the pod from a span flood -- FIRST processor, by rule
+      // -----------------------------------------------------------------------------------
+      // Logs are self-limiting: a file can only be read so fast. Traces are not -- a load
+      // test, or a retry storm, can push spans faster than downstream accepts them, the
+      // batch queue grows, and the container is OOMKilled. That kills the LOGS pipeline
+      // too, because both run in the same process.
+      //
+      // This processor checks its own memory use and starts REFUSING spans before that
+      // happens. The receiver then returns an error to the app, whose SDK drops them.
+      // Losing some spans is the correct trade: sampled traces are still useful, a dead
+      // collector is not.
+      //
+      // WHY IT MUST BE FIRST: every processor after the receiver allocates -- k8sattributes
+      // copies attributes onto each span, batch holds spans in memory. If the limiter sat
+      // behind them, the memory it is meant to protect would already be spent by the time
+      // a span reached it. Shedding has to happen before anything else touches the data.
+      //
+      // `limit` is set below the container memory limit (512Mi) to leave headroom for Alloy's
+      // own runtime and the logs pipeline. `spike_limit` is how much of that is reserved for
+      // a sudden burst: the soft limit is (limit - spike_limit) = 225MiB, and crossing it
+      // starts refusing. check_interval is how often memory is sampled.
+      //
+      // NOTE: these are Alloy's names. The upstream OpenTelemetry Collector calls them
+      // limit_mib / spike_limit_mib as plain integers; Alloy renames them and takes a byte
+      // string instead. Collector YAML examples copied from the internet fail here with
+      // "unrecognized attribute name". Check any component with:
+      //   kubectl exec -n monitoring <alloy-pod> -c alloy -- alloy validate /path/to.alloy
+      otelcol.processor.memory_limiter "default" {
+        check_interval = "1s"
+        limit          = "300MiB"
+        spike_limit    = "75MiB"
+
+        output {
+          traces = [otelcol.processor.k8sattributes.default.input]
+        }
+      }
+
+      // -----------------------------------------------------------------------------------
+      // 9. Attach Kubernetes identity to each span
+      // -----------------------------------------------------------------------------------
+      // A span arrives knowing only what the SDK put in it (service.name, http.route...).
+      // It does NOT know which pod, node or namespace it came from. Without this processor
+      // you cannot answer "which pod served the slow request", and you cannot pivot from a
+      // span to that pod's logs in Loki -- the labels simply would not match.
+      //
+      // The RBAC this needs (pods, namespaces, replicasets: get/list/watch) is already in
+      // the chart's ClusterRole, because the logs pipeline's discovery.kubernetes needs it.
+      // When this processor silently enriches nothing, RBAC is the first thing to check:
+      // a forbidden watch is logged once at startup and never again.
+      //
+      // Two association rules, tried in order. The FIRST that produces a pod identifier wins.
+      otelcol.processor.k8sattributes "default" {
+        // Rule 1 -- the app tells us who it is. Authoritative, and immune to both problems
+        // below. The Deployments set these via the downward API:
+        //
+        //   OTEL_RESOURCE_ATTRIBUTES=k8s.pod.name=$(K8S_POD_NAME),k8s.namespace.name=$(K8S_NAMESPACE_NAME)
+        pod_association {
+          source {
+            from = "resource_attribute"
+            name = "k8s.pod.name"
+          }
+          source {
+            from = "resource_attribute"
+            name = "k8s.namespace.name"
+          }
+        }
+
+        // Rule 2 -- infer the pod from the connection's source IP. Needs nothing from the
+        // app. Two ways it can fail, both verified on this cluster:
+        //
+        //  a) INFORMER RACE. The lookup uses a cached pod list built from a Kubernetes watch.
+        //     A pod that sends a span within a second or two of starting is not in that cache
+        //     yet, so the span arrives with service.name only and no k8s.* attributes. Proven
+        //     here: a span sent ~2s after pod creation got nothing; the same pod 35s later got
+        //     the full set. This matters for startup spans and short-lived Jobs.
+        //
+        //  b) LOST SOURCE IP. Anything that SNATs between app and collector makes the IP
+        //     useless. Node-local hostPort delivery (see extraPorts) avoids that today.
+        //
+        // Rule 1 fixes both, which is why it is listed first.
+        pod_association {
+          source {
+            from = "connection"
+          }
+        }
+
+        extract {
+          // These become resource attributes on the span, and are what Grafana's
+          // "trace to logs" uses to build the matching Loki query.
+          metadata = [
+            "k8s.namespace.name",
+            "k8s.pod.name",
+            "k8s.deployment.name",
+            "k8s.node.name",
+            "k8s.container.name",
+          ]
+        }
+
+        output {
+          traces = [otelcol.processor.batch.default.input]
+        }
+      }
+
+      // -----------------------------------------------------------------------------------
+      // 10. Batch spans before sending -- LAST processor, by rule
+      // -----------------------------------------------------------------------------------
+      // Without this, every span is its own request downstream. Batching trades a little
+      // latency for far fewer, larger writes.
+      //
+      // WHY IT MUST BE LAST: k8sattributes works per span, looking up the sender of each
+      // one. Put batch before it and a batch holding spans from several pods would be
+      // looked up ONCE and the whole batch stamped with one pod's identity -- quietly
+      // mislabelling most of the spans in it. Enrich first, then group.
+      //
+      // Whichever limit is hit first triggers a send: 1024 spans, or 5 seconds. The timeout
+      // matters on a quiet local cluster -- with only the batch size set, a handful of spans
+      // from one manual request would sit in the buffer and never appear in Grafana, which
+      // looks exactly like a broken pipeline.
+      otelcol.processor.batch "default" {
+        send_batch_size = 1024
+        timeout         = "5s"
+
+        output {
+          traces = [otelcol.exporter.loadbalancing.gateway.input]
+        }
+      }
+
+      // -----------------------------------------------------------------------------------
+      // 11. Forward to the gateway tier -- routed by trace id
+      // -----------------------------------------------------------------------------------
+      // The agent does NOT talk to Tempo. It forwards to the gateway (alloy-gateway-values
+      // .yaml), which does tail sampling and attribute scrubbing before Tempo.
+      //
+      // WHY A LOAD-BALANCING EXPORTER AND NOT A PLAIN otlp EXPORTER TO A SERVICE:
+      // Tail sampling decides per TRACE, after the whole trace has arrived. A trace's spans
+      // come from several services on several nodes, so several agents forward them. If
+      // each agent sent to a normal ClusterIP Service in front of 3 gateway replicas, the
+      // spans of ONE trace would be scattered across all 3; each replica would see a
+      // fragment, judge "no error here, not slow here", and drop it -- the error that lived
+      // in the fragment on another replica would be gone. Tail sampling behind a round-robin
+      // Service silently stops keeping the traces it exists to keep.
+      //
+      // The standard fix is this exporter: it hashes the TRACE ID and always sends every
+      // span of a trace to the same gateway replica. It discovers the replicas through a
+      // HEADLESS Service (clusterIP: None), whose DNS name resolves to the pod ips rather
+      // than to one virtual ip. With one replica today it behaves like a plain exporter;
+      // the point is that scaling the gateway later cannot break sampling.
+      otelcol.exporter.loadbalancing "gateway" {
+        routing_key = "traceID"
+
+        resolver {
+          dns {
+            hostname = "alloy-gateway-headless.monitoring.svc.cluster.local"
+            port     = "4317"
+          }
+        }
+
+        protocol {
+          otlp {
+            client {
+              // Plaintext gRPC inside the cluster. insecure = true means no TLS, not
+              // "skip certificate verification" (that would be insecure_skip_verify).
+              tls {
+                insecure = true
+              }
+            }
+          }
+        }
+      }
+
+  # ---------------------------------------------------------------------------------------
+  # How the apps reach the receiver: NODE-LOCAL, via hostPort
+  # ---------------------------------------------------------------------------------------
+  # Declaring a listener in the config above is not enough: the port must also be opened on
+  # the container, or nothing can connect. extraPorts does that, adds the port to the chart's
+  # `alloy` Service, and -- because the chart passes the field straight through -- binds a
+  # hostPort on the NODE.
+  #
+  # hostPort is what makes delivery node-local. Each app pod is given its node's ip by the
+  # downward API (status.hostIP) and sends to http://$(NODE_IP):4318, so a span never leaves
+  # the node it was produced on. Compared with the cluster-wide Service address:
+  #   - a network partition or the loss of other nodes cannot stop a pod emitting
+  #   - a stalled agent only back-pressures the apps on ITS node, not a random one
+  #   - the source ip the k8sattributes fallback relies on is never rewritten
+  #
+  # The cost: a hostPort can be claimed by one pod per node, so a conflict leaves the
+  # DaemonSet pod stuck Pending with "node(s) didn't have free ports". Nothing else here
+  # uses 4317/4318. The Service address still works and is documented in the Deployments
+  # as the fallback.
+  extraPorts:
+    - name: otlp-grpc
+      port: 4317
+      targetPort: 4317
+      hostPort: 4317
+      protocol: TCP
+      # h2c = HTTP/2 without TLS, which is what plaintext gRPC is. Without this the Service
+      # may treat the port as HTTP/1.1 and gRPC streams fail in ways that are hard to read.
+      appProtocol: h2c
+    - name: otlp-http
+      port: 4318
+      targetPort: 4318
+      hostPort: 4318
+      protocol: TCP
+      appProtocol: http
+
+  mounts:
+    # Mounts the node's /var/log into the pod (read-only), which is where /var/log/pods lives.
+    # Without it, local.file_match finds the patterns but no files exist inside the container.
+    varlog: true
+    # Only for nodes running Docker as the container runtime (/var/lib/docker/containers).
+    # kind nodes run containerd, whose logs are under /var/log/pods, so this stays off.
+    dockercontainers: false
+
+  # The log files on the node are root:root with mode 0640, so only root can read them.
+  # The chart's default (empty) securityContext runs Alloy as root, which is what allows that.
+  # If you add a securityContext with a non-root user, every file fails with "permission denied".
+
+  resources:
+    requests:
+      cpu: 50m
+      memory: 64Mi
+    limits:
+      # Raised from 256Mi when the traces pipeline was added: the batch processor buffers
+      # spans in memory, on top of everything the logs pipeline already holds. Keep this
+      # comfortably above memory_limiter.limit_mib (300) so the limiter sheds load first --
+      # if the container limit is hit instead, the kernel OOMKills the pod and the logs
+      # pipeline dies with it.
+      memory: 512Mi
+
+  # Stop Alloy sending anonymous usage statistics to Grafana Labs.
+  enableReporting: false
+
+controller:
+  # One Alloy pod per node. Required for file-based collection: a single Deployment can
+  # only read its own node's disk.
+  type: daemonset
+
+  # kind's control-plane node carries the taint node-role.kubernetes.io/control-plane:NoSchedule.
+  # Without this toleration no Alloy pod runs there, and the logs of everything on that node
+  # are silently missing: ingress-nginx's controller, CoreDNS, and the API server among them.
+  tolerations:
+    - key: node-role.kubernetes.io/control-plane
+      operator: Exists
+      effect: NoSchedule
+
+# Alloy's own metrics (lines read, bytes sent, push errors) into your Prometheus. Your
+# Prometheus selects every ServiceMonitor (serviceMonitorSelectorNilUsesHelmValues: false).
+# Try: sum by (instance) (rate(loki_write_sent_entries_total[5m]))
+serviceMonitor:
+  enabled: true

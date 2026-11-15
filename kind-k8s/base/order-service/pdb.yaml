@@ -1,0 +1,20 @@
+# Caps how many pods voluntary disruptions (node drain, cluster upgrade) may remove at
+# once. It does NOT protect against crashes or node failure -- only against the eviction
+# API.
+#
+# minAvailable: 1, not 2. These deployments run 2-3 replicas, and "minAvailable: 2" with
+# 2 replicas computes to disruptionsAllowed: 0, which blocks `kubectl drain` forever --
+# the drain hangs and you are left wondering why. On a two-worker kind cluster that is
+# very easy to hit.
+#
+# Raise it once replica counts are higher; the useful rule is minAvailable < replicas.
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: order-service-pdb
+  namespace: ecommerce-dev
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app: order-service

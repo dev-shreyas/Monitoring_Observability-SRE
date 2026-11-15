@@ -1,0 +1,84 @@
+# Tempo for a local kind cluster.
+#
+# Chart: grafana-community/tempo 3.2.1 (Tempo 3.1.x, monolithic / single binary). The old
+# grafana/tempo chart is deprecated; the chart moved to the grafana-community repo.
+# Keys below were checked against `helm show values grafana-community/tempo --version 3.2.1`.
+# Helm silently ignores keys it does not recognise, so a typo here fails without an error.
+#
+# Install:
+#   helm repo add grafana-community https://grafana-community.github.io/helm-charts
+#   helm upgrade --install tempo grafana-community/tempo -n monitoring --version 3.2.1 -f tempo-values.yaml
+#
+# Result: ONE pod (tempo-0) with a 2Gi PVC. In-cluster addresses:
+#   tempo.monitoring.svc.cluster.local:4317   OTLP gRPC  <- Alloy sends spans here
+#   tempo.monitoring.svc.cluster.local:4318   OTLP HTTP
+#   tempo.monitoring.svc.cluster.local:3200   HTTP API   <- Grafana queries here
+#
+# Tempo 3 internals (tutorials mentioning "ingester" or "compactor" describe Tempo 2):
+#   distributor     receives spans over OTLP
+#   live-store      holds recent traces in memory + WAL, then flushes them as blocks
+#   backend worker  compacts blocks and deletes those past retention
+#   querier/frontend  answers search and TraceQL queries
+
+tempo:
+  # Stop Tempo sending anonymous usage statistics to Grafana Labs (same as Loki and Alloy).
+  reportingEnabled: false
+
+  # Single tenant, like Loki's auth_enabled: false. When true every push and query needs an
+  # X-Scope-OrgID header. This is the chart default; set explicitly so the choice is visible.
+  multitenancyEnabled: false
+
+  # How long traces are kept. Since chart 3.2.0 this is actually enforced by the backend
+  # worker (in 3.0-3.1 it was not). 3 days matches Prometheus and Loki.
+  retention: 72h
+
+  # Where traces are stored. "local" = the pod's own disk, i.e. the PVC below. Production
+  # uses s3, gcs or azure. These are the chart defaults, written out so they are visible.
+  storage:
+    trace:
+      backend: local
+      local:
+        path: /var/tempo/traces
+      wal:
+        path: /var/tempo/wal
+
+  # Protocols Tempo accepts spans on. Only OTLP is used: the apps' OpenTelemetry SDK sends
+  # OTLP to Alloy, and Alloy forwards OTLP here.
+  #
+  # The chart default also opens four Jaeger ports. They cannot be switched off here: Helm
+  # MERGES maps with the defaults, so leaving jaeger out keeps it, and setting it to null
+  # makes chart 3.2.1 fail to render (its Service template reads
+  # receivers.jaeger.protocols.thrift_compact unconditionally). The ports stay open, unused.
+  receivers:
+    otlp:
+      protocols:
+        grpc:
+          # 0.0.0.0, not localhost: Alloy runs in other pods.
+          endpoint: "0.0.0.0:4317"
+        http:
+          endpoint: "0.0.0.0:4318"
+
+  # Chart default is no requests or limits.
+  resources:
+    requests:
+      cpu: 100m
+      memory: 256Mi
+    limits:
+      memory: 1Gi
+
+  # Metrics generator (service graph, span metrics) stays off for now: step 6.8.
+
+# Without this, traces live in the container's filesystem and vanish on every pod restart.
+persistence:
+  enabled: true
+  # kind's built-in local-path provisioner, as for Loki.
+  storageClassName: standard
+  accessModes:
+    - ReadWriteOnce
+  size: 2Gi
+
+# Tempo's own metrics into your Prometheus. Your Prometheus selects every ServiceMonitor
+# (serviceMonitorSelectorNilUsesHelmValues: false), so no release label is needed.
+# Try: rate(tempo_distributor_spans_received_total[5m])
+serviceMonitor:
+  enabled: true

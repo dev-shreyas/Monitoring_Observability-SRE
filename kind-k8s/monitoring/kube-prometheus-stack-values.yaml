@@ -1,0 +1,124 @@
+prometheus:
+  prometheusSpec:
+    retention: 8d
+    storageSpec:
+      volumeClaimTemplate:
+        spec:
+          storageClassName: standard
+          accessModes: ["ReadWriteOnce"]
+          resources:
+            requests:
+              storage: 10Gi    
+    # 60s, not the 30s default: halves the samples Prometheus ingests and the rule
+    # evaluations it runs, on a laptop cluster where Prometheus was the single largest
+    # CPU consumer (~0.74 cores). Dashboards are unaffected: their fixed windows are
+    # >= 5m, and kube-prometheus-stack passes this interval to the Grafana datasource,
+    # so $__rate_interval widens to match.
+    scrapeInterval: 60s
+    evaluationInterval: 60s
+    serviceMonitorSelectorNilUsesHelmValues: false
+    podMonitorSelectorNilUsesHelmValues: false
+    ruleSelectorNilUsesHelmValues: false
+    probeSelectorNilUsesHelmValues: false
+    # Accept pushes on /api/v1/write. The k6 load generator (kind-k8s/load-testing) has no
+    # /metrics endpoint to scrape -- it pushes its client-side metrics here instead.
+    enableRemoteWriteReceiver: true
+
+grafana:
+  enabled: true
+  # Credentials come from a Secret created OUTSIDE this file, so no password is committed.
+  # This chart sets adminUser/adminPassword in a Secret it owns; pointing at an existing one
+  # makes Helm skip that and mount yours instead.
+  #
+  # Create it once per cluster (it is not part of `helm install`):
+  #   kubectl create secret generic grafana-admin -n monitoring \
+  #     --from-literal=admin-user=admin \
+  #     --from-literal=admin-password="$(LC_ALL=C tr -dc 'A-Za-z0-9' </dev/urandom | head -c 24)"
+  #
+  # Read the password back any time:
+  #   kubectl get secret grafana-admin -n monitoring -o jsonpath='{.data.admin-password}' | base64 -d
+  #
+  # Deleting the cluster deletes the Secret, so recreate it before the first helm install.
+  # If it is missing, the Grafana pod stays Pending on a volume that cannot mount.
+  admin:
+    existingSecret: grafana-admin
+    # Key names inside the Secret. These are the chart's defaults, written out because the
+    # kubectl command above has to match them exactly.
+    userKey: admin-user
+    passwordKey: admin-password
+  # A LIST of datasource objects, not a name. Each entry is the same shape Grafana writes
+  # into its provisioning YAML. A bare string here fails the subchart's schema check.
+  additionalDataSources:
+    - name: Loki
+      type: loki
+      # A FIXED uid. Without one Grafana generates a random uid every time it provisions
+      # this datasource -- and Grafana has no PVC here, so that is every pod restart.
+      # Dashboard panels reference datasources BY UID, so a dashboard built against the old
+      # random uid shows "datasource not found" after the next restart (the same failure the
+      # RED dashboard's CPU panel had with "ffzzoqcxmeccgf"). Tempo is pinned the same way.
+      uid: loki
+      # "proxy" = Grafana's backend makes the request, so the URL is resolved inside the
+      # cluster. "direct" would make the browser call it and need a reachable address.
+      access: proxy
+      # The gateway is disabled in loki-values.yaml, so this is the loki Service itself.
+      # Port 3100 is HTTP; 9095 is gRPC and will not answer here.
+      url: http://loki.monitoring.svc.cluster.local:3100
+      # Prometheus is already the default datasource from the parent chart; leave this false
+      # so "Explore" still opens on metrics.
+      isDefault: false
+      jsonData:
+        # Cap on lines returned per query. Grafana's default is 1000; low enough that a
+        # broad query cannot lock up the browser tab.
+        maxLines: 1000
+    - name: tempo
+      type: tempo
+      access: proxy
+      url: http://tempo.monitoring.svc.cluster.local:3200
+      isDefault: false
+      uid: tempo
+  # Grafana traces ITSELF into the same pipeline as the apps (OTLP/gRPC -> Alloy agent ->
+  # gateway -> Tempo). This is what puts traces from the `monitoring` namespace on the RED
+  # dashboard's traces row: Grafana is the main thing in that namespace you interact with,
+  # and a trace of a slow panel shows whether the time went to Loki, Tempo or Prometheus.
+  #
+  # sampler const/1 = record every request; the gateway's tail sampling then keeps all
+  # errors and slow ones and 10% of the rest, so this does not flood Tempo.
+  # Plain host:port, no scheme: Grafana's OTLP exporter is gRPC.
+  grafana.ini:
+    tracing.opentelemetry:
+      sampler_type: const
+      sampler_param: 1
+    tracing.opentelemetry.otlp:
+      address: alloy.monitoring.svc.cluster.local:4317
+      propagation: w3c
+  ingress:
+    enabled: true
+    ingressClassName: nginx
+    hosts:
+      - grafana.localhost
+    path: /  
+
+    # annotations:
+    #   kubernetes.io/ingress.class: nginx
+    #   cert-manager.io/cluster-issuer: letsencrypt-prod
+    # tls:
+    #   - secretName: grafana-tls
+    #     hosts:
+    #       - grafana.local 
+
+kubeEtcd:
+  enabled: false
+
+kubeScheduler:
+  enabled: false
+
+kubeControllerManager:
+  enabled: false
+
+kubeProxy:
+  enabled: false
+
+defaultRules:
+  disabled: {
+    NodeClockNotSynchronising: true
+  }         

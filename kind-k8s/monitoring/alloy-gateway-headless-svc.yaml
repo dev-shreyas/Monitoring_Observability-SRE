@@ -1,0 +1,34 @@
+# Headless Service for the trace gateway.
+#
+# The agents' otelcol.exporter.loadbalancing hashes each trace id and sends ALL spans of a
+# trace to ONE gateway replica. To do that it must know the replicas INDIVIDUALLY. A normal
+# Service hides them behind a single virtual ip and round-robins connections, which is the
+# exact behaviour that would scatter a trace. `clusterIP: None` makes the DNS name
+# alloy-gateway-headless.monitoring.svc.cluster.local resolve to the pod ips themselves, one
+# A record per ready pod, and the exporter re-resolves as replicas come and go.
+#
+# The label selector matches what the grafana/alloy chart puts on the alloy-gateway release's
+# pods (app.kubernetes.io/name is the chart name, app.kubernetes.io/instance the release).
+apiVersion: v1
+kind: Service
+metadata:
+  name: alloy-gateway-headless
+  namespace: monitoring
+  labels:
+    app.kubernetes.io/name: alloy
+    app.kubernetes.io/instance: alloy-gateway
+    app.kubernetes.io/component: gateway-headless
+spec:
+  clusterIP: None
+  # Only READY pods get an A record, so an agent never routes a trace to a gateway that is
+  # still starting and would drop it.
+  publishNotReadyAddresses: false
+  selector:
+    app.kubernetes.io/name: alloy
+    app.kubernetes.io/instance: alloy-gateway
+  ports:
+    - name: otlp-grpc
+      port: 4317
+      targetPort: 4317
+      protocol: TCP
+      appProtocol: h2c

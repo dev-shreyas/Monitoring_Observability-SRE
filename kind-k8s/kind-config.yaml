@@ -1,0 +1,35 @@
+# Cluster shaped for running the app plus an observability stack on a laptop.
+#
+# Changes from the original 1 control-plane + 3 workers:
+#   - two workers, not three. Every node is a container running its own kubelet, and
+#     the memory that third one costs is better spent on Prometheus/Loki/Grafana.
+#   - port mappings for the ingress controller, so http://localhost works from the host.
+#     kind has no cloud load balancer: a Service of type LoadBalancer stays <pending>
+#     forever unless you add MetalLB. extraPortMappings is the simple alternative.
+#
+# Port mappings can ONLY be set at cluster creation. Adding them later means deleting and
+# recreating the cluster, so they are worth getting right up front.
+kind: Cluster
+apiVersion: kind.x-k8s.io/v1alpha4
+nodes:
+  - role: control-plane
+    kubeadmConfigPatches:
+      # ingress-nginx's kind deployment selects nodes with this label. Without it the
+      # controller pod sits Pending with "node(s) didn't match Pod's node affinity".
+      - |
+        kind: InitConfiguration
+        nodeRegistration:
+          kubeletExtraArgs:
+            node-labels: "ingress-ready=true"
+    extraPortMappings:
+      - containerPort: 80          # ingress-nginx HTTP
+        hostPort: 80
+        protocol: TCP
+      - containerPort: 443         # ingress-nginx HTTPS
+        hostPort: 443
+        protocol: TCP
+      - containerPort: 30003       # kept from the original config
+        hostPort: 30003
+        protocol: TCP
+  - role: worker
+  - role: worker
